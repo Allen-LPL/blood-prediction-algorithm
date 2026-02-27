@@ -15,7 +15,7 @@ if __name__ == '__main__':
         df.rename(columns={'采血部门': '血站',
                            '档案血型': '血型',
                            '采血量': '血量'}, inplace=True)
-        df = df[~df["组织方式"].isin(["团体预约", "团体无偿"])]
+        #df = df[~df["组织方式"].isin(["团体预约", "团体无偿"])]
         df["date"] = pd.to_datetime(
             df["采血时间"],
             format="%Y/%m/%d %H:%M:%S"
@@ -46,4 +46,4 @@ if __name__ == '__main__':
 
     print("总数据量:", df_all.shape)
 
-    df_all.to_csv("./feature/remove_group_data.csv", index=False)
+    df_all.to_csv("./feature/all_data.csv", index=False)

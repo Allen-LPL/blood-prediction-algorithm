@@ -121,7 +121,7 @@ def metric_item(true_y, pred_y):
 
 
 def load_blood_data():
-    all_df = pd.read_csv('../lstm/feature/remove_group_data.csv')
+    all_df = pd.read_csv('../lstm/feature/all_data.csv')
     all_df["date"] = pd.to_datetime(all_df["date"])
     return all_df
 
