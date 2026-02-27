@@ -2,3 +2,6 @@ lstm/data
 lstm/feature
 .idea
 .DS_Store
+.xlsx
+.csv
+.png
