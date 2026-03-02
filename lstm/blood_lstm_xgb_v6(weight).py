@@ -158,7 +158,7 @@ def add_prev_rolling_sums(df: pd.DataFrame,
     max_date = df[DATE_COL].max()
     full_dates = pd.DataFrame({DATE_COL: pd.date_range(min_date, max_date, freq="D")})
 
-    df = full_dates.merge(df, on=DATE_COL, how="left")
+    df = pd.merge(full_dates, df, on=DATE_COL, how="left")
     df[TARGET_COL] = df[TARGET_COL].fillna(0.0)
 
     # 只做排序，不做聚合
@@ -406,39 +406,39 @@ def build_lstm_residual_model(lookback: int, lr: float = 1e-3):
 
 
 def add_dynamic_feature(g2: pd.DataFrame):
-    g2["lag1"] = g2[TARGET_COL].shift(1)
-    g2["lag7"] = g2[TARGET_COL].shift(7)
-    if "rolling7" not in g2.columns:
-        g2["rolling7"] = g2[TARGET_COL].rolling(7).mean()
+    g2["lag1"] = g2[TARGET_COL].shift(1).fillna(0)
+    g2["lag7"] = g2[TARGET_COL].shift(7).fillna(0)
 
-    g2["absdiff1"] = (g2[TARGET_COL] - g2["lag1"]).abs()
-    g2["rolling_std7"] = g2[TARGET_COL].rolling(7).std()
-    g2["rolling_std14"] = g2[TARGET_COL].rolling(14).std()
-    g2["rolling_absdiff7"] = g2["absdiff1"].rolling(7).mean()
+    g2["rolling7"] = g2[TARGET_COL].rolling(7).mean().fillna(0)
 
-    g2["lag14"] = g2[TARGET_COL].shift(14)
-    g2["lag28"] = g2[TARGET_COL].shift(28)
 
-    g2["absdiff7"] = (g2[TARGET_COL] - g2["lag7"]).abs()
-    g2["diff7"] = (g2[TARGET_COL] - g2["lag7"])
-    g2["diff14"] = (g2[TARGET_COL] - g2["lag14"])
+    g2["absdiff1"] = (g2[TARGET_COL] - g2["lag1"]).abs().fillna(0)
+    g2["rolling_std7"] = g2[TARGET_COL].rolling(7).std().fillna(0)
+    g2["rolling_std14"] = g2[TARGET_COL].rolling(14).std().fillna(0)
+    g2["rolling_absdiff7"] = g2["absdiff1"].rolling(7).mean().fillna(0)
 
-    g2["rolling14"] = g2[TARGET_COL].rolling(14).mean()
-    g2["rolling28"] = g2[TARGET_COL].rolling(28).mean()
-    g2["ewm7"] = g2[TARGET_COL].ewm(span=7, adjust=False).mean()
-    g2["ewm14"] = g2[TARGET_COL].ewm(span=14, adjust=False).mean()
+    g2["lag14"] = g2[TARGET_COL].shift(14).fillna(0)
+    g2["lag28"] = g2[TARGET_COL].shift(28).fillna(0)
+
+    g2["absdiff7"] = (g2[TARGET_COL] - g2["lag7"]).abs().fillna(0)
+    g2["diff7"] = (g2[TARGET_COL] - g2["lag7"]).fillna(0)
+    g2["diff14"] = (g2[TARGET_COL] - g2["lag14"]).fillna(0)
+
+    g2["rolling14"] = g2[TARGET_COL].rolling(14).mean().fillna(0)
+    g2["rolling28"] = g2[TARGET_COL].rolling(28).mean().fillna(0)
+    g2["ewm7"] = g2[TARGET_COL].ewm(span=7, adjust=False).mean().fillna(0)
+    g2["ewm14"] = g2[TARGET_COL].ewm(span=14, adjust=False).mean().fillna(0)
     return g2
 
 
 def train_one_group(group, group_blood_df, weather_df):
-    lookback = 60
+    LOOK_BACK = 60
     lstm_lr = 1e-3
+
     # 1.blood特征
-    label_col = "label_tplus1"
+    label_col = TARGET_COL
     group_blood_df = add_prev_rolling_sums(group_blood_df, windows=(1, 3, 7, 14, 28))
     group_blood_df = add_dynamic_feature(group_blood_df)
-    group_blood_df[label_col] = group_blood_df[TARGET_COL].shift(-1)
-    group_blood_df = group_blood_df.dropna(subset=["label_tplus1"])
 
     # 2.合并blood weather
     df = pd.merge(group_blood_df, weather_df, on="date", how="left")
@@ -446,14 +446,68 @@ def train_one_group(group, group_blood_df, weather_df):
     df = df.sort_values(DATE_COL).reset_index(drop=True)
 
     # xgb 特征
-    feat_cols = []
+    xgb_feat_cols = []
     for col in df.columns:
-        if col in [TARGET_COL, label_col, DATE_COL, 'date_x', 'date_y']:
+        if col in [TARGET_COL, label_col, DATE_COL, 'date_x', 'date_y', STATION_COL,
+                   'lag1', '1d_sum']:
             continue
-        feat_cols.append(col)
+        xgb_feat_cols.append(col)
+
+    lstm_feat_cols = []
+    for col in df.columns:
+        if col in [TARGET_COL, label_col, DATE_COL, 'date_x', 'date_y',STATION_COL,
+                   'lag1', '1d_sum']:
+            continue
+        if (col.startswith('lag') | col.startswith('rolling') | col.startswith('absdiff')
+                | col.startswith('diff') | col.startswith('ewm') | col.endswith('sum')):
+            continue
+        lstm_feat_cols.append(col)
+
+    # lstm
+    TEST_RATIO = 0.2
+    df["trend"] = df[TARGET_COL].rolling(7).mean()
+    df["residual"] = df[TARGET_COL] - df["trend"]
+    split = int(len(df) * (1 - TEST_RATIO))
+    train_end = split
+    lstm_mat = df[lstm_feat_cols + ["trend"]].astype(float).values
+    scaler = MinMaxScaler()
+    scaler.fit(lstm_mat[:train_end])
+    lstm_scaled = scaler.transform(lstm_mat)
+    y_index = lstm_scaled.shape[1] - 1  # trend 在最后一列
+
+    X_all, y_all = make_lstm_xy(lstm_scaled, LOOK_BACK, y_index)
+
+    sample_split = train_end - LOOK_BACK
+
+    X_train, X_test = X_all[:sample_split], X_all[sample_split:]
+    y_train, y_test = y_all[:sample_split], y_all[sample_split:]
+
+    # val 取训练末尾10%
+    val_cut = int(len(X_train) * 0.9)
+    X_tr, X_val = X_train[:val_cut], X_train[val_cut:]
+    y_tr, y_val = y_train[:val_cut], y_train[val_cut:]
+
+    model = build_lstm(LOOK_BACK, X_all.shape[2])
+    es = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+
+    model.fit(
+        X_tr, y_tr,
+        validation_data=(X_val, y_val),
+        epochs=120,
+        batch_size=64,
+        callbacks=[es],
+        verbose=0
+    )
+
+    trend_pred_scaled = model.predict(X_test, verbose=0).flatten()
+    trend_true_scaled = y_test
+
+    feature_dim = lstm_scaled.shape[1]
+    trend_pred = inverse_one_col(scaler, trend_pred_scaled, feature_dim, y_index)
+    trend_true = inverse_one_col(scaler, trend_true_scaled, feature_dim, y_index)
 
     # 3.切分训练集 测试集
-    X, y, target_dates = df[feat_cols].values, df[label_col].values, df[DATE_COL].values
+    X, y, target_dates = df[xgb_feat_cols].values, df[label_col].values, df[DATE_COL].values
     X_train, X_test, Y_train, Y_test, d_train, d_test = train_test_split(
         X,
         y,
@@ -495,7 +549,7 @@ def train_one_group(group, group_blood_df, weather_df):
     xgb.fit(X_train, Y_train, eval_set=[
         (X_test, Y_test)], sample_weight=sample_weight)
 
-    df["y_xgb"] = xgb.predict(df[feat_cols].to_numpy(dtype=np.float32)).astype(np.float32)
+    df["y_xgb"] = xgb.predict(df[xgb_feat_cols].to_numpy(dtype=np.float32)).astype(np.float32)
     df["resid"] = (df[TARGET_COL] - df["y_xgb"]).astype(np.float32)
 
     # -------------------------
