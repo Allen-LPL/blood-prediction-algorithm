@@ -5,3 +5,5 @@ lstm/feature
 .xlsx
 .csv
 .png
+/text_classify/data/
+/lstm_cnn/out_group_models_v2/

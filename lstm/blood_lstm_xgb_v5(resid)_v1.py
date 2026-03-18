@@ -7,15 +7,13 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Layer
-import tensorflow.keras.backend as K
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 from matplotlib.font_manager import FontProperties
 from xgboost import XGBRegressor
@@ -392,43 +390,13 @@ def make_residual_sequences(feature_mat: np.ndarray, resid_target: np.ndarray, l
     return X, y, idx
 
 
-class Attention(Layer):
-    def __init__(self, **kwargs):
-        super(Attention, self).__init__(**kwargs)
-
-    def build(self, input_shape):
-        self.W = self.add_weight(name='attention_weight', 
-                                 shape=(input_shape[-1], 1), 
-                                 initializer='random_normal', 
-                                 trainable=True)
-        self.b = self.add_weight(name='attention_bias', 
-                                 shape=(input_shape[1], 1), 
-                                 initializer='zeros', 
-                                 trainable=True)
-        super(Attention, self).build(input_shape)
-
-    def call(self, x):
-        # x: (batch_size, time_steps, features)
-        e = K.tanh(K.dot(x, self.W) + self.b)
-        e = K.squeeze(e, axis=-1)   
-        alpha = K.softmax(e)
-        alpha = K.expand_dims(alpha, axis=-1)
-        context = x * alpha
-        context = K.sum(context, axis=1)
-        return context
-
-
 def build_lstm_residual_model(lookback: int, feature_dim: int, lr: float = 1e-3):
     inp = layers.Input(shape=(lookback, feature_dim))
-    # 恢复稍微轻量化一点的双向LSTM，去掉复杂的自定义Attention防止小样本过拟合
     x = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(inp)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.2)(x)
-    
-    # 最后一层LSTM直接输出最终隐藏状态即可
-    x = layers.Bidirectional(layers.LSTM(32, return_sequences=False))(x) 
+    x = layers.LSTM(32)(x)
     x = layers.BatchNormalization()(x)
-    
     x = layers.Dense(32, activation="relu")(x)
     x = layers.Dropout(0.1)(x)
     out = layers.Dense(1, activation="linear")(x)
@@ -436,7 +404,7 @@ def build_lstm_residual_model(lookback: int, feature_dim: int, lr: float = 1e-3)
     model = models.Model(inp, out)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
-        loss='mse',
+        loss='mse',  # 使用 mse 更适合残差预测
         metrics=[tf.keras.metrics.MAE]
     )
     return model
@@ -521,8 +489,6 @@ def train_one_group(group, group_blood_df, weather_df):
         'early_stopping_rounds': 20,
         'missing': 0
     }
-    
-    # 恢复原版手动权重：在业务上这可能确实反映了高血量的极端重要性，平方根不够激进
     sample_weight = []
     for y_val_w in Y_train:
         weight = 3
@@ -633,98 +599,43 @@ def train_one_group(group, group_blood_df, weather_df):
     idx_te = idx_seq[te_mask]
     df.loc[idx_te, "resid_pred"] = resid_pred
 
-    # 融合预测：引入自适应Meta-Learner代替硬相加
-    # ==========================
-    # 在测试集上，我们获取了 y_xgb 和 resid_pred
-    df["resid_pred"] = df["resid_pred"].fillna(0) # 以防有些早期天数没有预测
-    df["y_hat"] = df["y_xgb"] + df["resid_pred"] # 保留 baseline 硬相加
-    
-    # 构建 Meta-Learner (基于训练集最后一段验证集的残差预测分布来学习融合权重)
-    # 为了简单且不泄露数据，我们直接对 y_xgb 和 resid_pred 进行带保护的硬相加，但对于极端的残差预测进行衰减 (平滑处理)
-    # 因为 LSTM 有时候预测出来的残差会过大(尤其是在节假日或者突变日)
-    df["resid_pred_clipped"] = np.clip(df["resid_pred"], -abs(df["y_xgb"])*0.5, abs(df["y_xgb"])*0.5) 
-    
-    # 自适应融合预测：y_hat_adaptive
-    df["y_hat_adaptive"] = df["y_xgb"] + df["resid_pred_clipped"]
+    # 融合预测：y_hat = y_xgb + resid_pred
+    df["y_hat"] = df["y_xgb"] + df["resid_pred"]
 
     # 评估：只评估测试区间中，存在 resid_pred 的那些天（因为序列需要 lookback）
-    eval_df = df.loc[idx_te, [DATE_COL, TARGET_COL, "y_xgb", "y_hat", "y_hat_adaptive"]].copy()
+    eval_df = df.loc[idx_te, [DATE_COL, TARGET_COL, "y_xgb", "y_hat"]].copy()
     eval_df = eval_df.sort_values(DATE_COL).reset_index(drop=True)
 
     mae_xgb = mean_absolute_error(eval_df[TARGET_COL], eval_df["y_xgb"])
     mae_hat = mean_absolute_error(eval_df[TARGET_COL], eval_df["y_hat"])
-    mae_hat_adp = mean_absolute_error(eval_df[TARGET_COL], eval_df["y_hat_adaptive"])
-    
-    # 计算 MAPE (平均绝对百分比误差/误差率)
-    # 为了防止分母为 0 导致报错或无穷大，加上一个极小值 eps
-    eps = 1e-8
-    mape_xgb = np.mean(np.abs((eval_df[TARGET_COL] - eval_df["y_xgb"]) / (eval_df[TARGET_COL] + eps))) * 100
-    mape_hat = np.mean(np.abs((eval_df[TARGET_COL] - eval_df["y_hat"]) / (eval_df[TARGET_COL] + eps))) * 100
-    mape_hat_adp = np.mean(np.abs((eval_df[TARGET_COL] - eval_df["y_hat_adaptive"]) / (eval_df[TARGET_COL] + eps))) * 100
-
-    print(f"[MAE] XGB={mae_xgb:.3f}  XGB+LSTM={mae_hat:.3f}  Adaptive={mae_hat_adp:.3f}")
-    print(f"[误差率 MAPE] XGB={mape_xgb:.2f}%  XGB+LSTM={mape_hat:.2f}%  Adaptive={mape_hat_adp:.2f}%")
+    print(f"[MAE] XGB={mae_xgb:.3f}  XGB+LSTM={mae_hat:.3f}")
 
     # -------------------------
-    # 输出：生成并保存专利和论文所需的高质量对比图
+    # 输出：loss 曲线、预测对比图、保存模型
     # -------------------------
-    
-    # 创建保存目录
-    os.makedirs("patent_figures", exist_ok=True)
-    
-    # 1. 截取最近100天用于画图展示细节
-    k = min(100, len(eval_df))
-    plot_df = eval_df.iloc[-k:].copy()
-    
-    # 设置中文字体
-    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei'] # 兼容mac和win
-    plt.rcParams['axes.unicode_minus'] = False
-    
-    # ---------------------------------------------
-    # 图1：预测效果全景对比图 (真值 vs XGB vs 本发明双架构)
-    # ---------------------------------------------
-    plt.figure(figsize=(14, 6), dpi=300)
-    plt.plot(plot_df[DATE_COL], plot_df[TARGET_COL], label="真实血量", color='#1f77b4', linewidth=2.5, marker='o', markersize=4)
-    plt.plot(plot_df[DATE_COL], plot_df["y_xgb"], label="仅使用XGBoost(基线)", color='#ff7f0e', linestyle='--', linewidth=2)
-    plt.plot(plot_df[DATE_COL], plot_df["y_hat_adaptive"], label="本发明预测(XGBoost+Bi-LSTM自适应)", color='#2ca02c', linewidth=2.5)
-    
-    # 标出突变点差异
-    plt.fill_between(plot_df[DATE_COL], plot_df["y_xgb"], plot_df["y_hat_adaptive"], 
-                     color='gray', alpha=0.2, label="深度残差修正幅度")
-                     
-    plt.title(f"{group} - 基准模型与本发明混合模型预测效果对比 (MAE: {mae_hat_adp:.1f})", fontsize=16, fontweight='bold')
-    plt.xlabel("日期", fontsize=12)
-    plt.ylabel("总血量 (U)", fontsize=12)
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.legend(fontsize=12, loc='upper left')
-    plt.tight_layout()
-    plt.savefig(f"patent_figures/{group}_1_prediction_comparison.png")
-    plt.close()
+    # loss curve
+    # plt.figure(figsize=(8, 4.5))
+    # plt.plot(hist.history.get("loss", []), label="train_loss")
+    # plt.plot(hist.history.get("val_loss", []), label="val_loss")
+    # plt.title(f"{group} LSTM Residual Loss", fontproperties=FONT)
+    # plt.xlabel("Epoch")
+    # plt.ylabel("Loss")
+    # plt.legend()
+    # plt.tight_layout()
+    # plt.show()
 
-    # ---------------------------------------------
-    # 图2：残差修正跟踪图 (XGB误差 vs LSTM预测的修正量)
-    # ---------------------------------------------
-    plt.figure(figsize=(14, 4), dpi=300)
-    
-    # 计算真实的 XGB 残差
-    real_resid = plot_df[TARGET_COL] - plot_df["y_xgb"]
-    # 提取我们 LSTM 给出的修正量
-    lstm_resid_pred = plot_df["y_hat_adaptive"] - plot_df["y_xgb"]
-    
-    plt.bar(plot_df[DATE_COL], real_resid, label="XGBoost基线真实误差", color='#ff9896', alpha=0.7)
-    plt.plot(plot_df[DATE_COL], lstm_resid_pred, label="Bi-LSTM预测的修正残差", color='black', linewidth=2, marker='x', markersize=5)
-    
-    plt.axhline(0, color='gray', linestyle='-')
-    plt.title(f"{group} - 本发明 Bi-LSTM 对基线误差的动态捕捉效果", fontsize=16)
-    plt.xlabel("日期", fontsize=12)
-    plt.ylabel("误差幅度", fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True, alpha=0.3)
+    # pred vs true（只画测试最后 120 天里可评估的部分）
+    k = min(120, len(eval_df))
+    plt.figure(figsize=(12, 4.5))
+    plt.plot(eval_df[DATE_COL].iloc[-k:], eval_df[TARGET_COL].iloc[-k:], label="true")
+    plt.plot(eval_df[DATE_COL].iloc[-k:], eval_df["y_xgb"].iloc[-k:], label="xgb")
+    plt.plot(eval_df[DATE_COL].iloc[-k:], eval_df["y_hat"].iloc[-k:], label="xgb+lstm")
+    plt.title(f"{group} predict", fontproperties=FONT)
+    plt.xlabel("Date")
+    plt.ylabel(TARGET_COL, fontproperties=FONT)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(f"patent_figures/{group}_2_residual_tracking.png")
-    plt.close()
-    
-    print(f"[{group}] 专利/论文插图已成功导出至 patent_figures 文件夹。")
+    plt.show()
 
 
 def main():

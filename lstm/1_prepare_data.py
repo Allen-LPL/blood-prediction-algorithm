@@ -47,3 +47,7 @@ if __name__ == '__main__':
     print("总数据量:", df_all.shape)
 
     df_all.to_csv("./feature/all_data.csv", index=False)
+
+
+    # source ~/tf_arm_env/bin/activate
+    # deactivate
