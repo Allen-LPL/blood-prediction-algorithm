@@ -7,3 +7,8 @@ lstm/feature
 .png
 /text_classify/data/
 /lstm_cnn/out_group_models_v2/
+xgb/models
+lstm/patent_figures/
+xgb/__pycache__/
+.history/
+doc/
