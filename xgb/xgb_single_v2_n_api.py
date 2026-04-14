@@ -15,9 +15,10 @@ XGBoost 采血量预测 — 模型持久化 + API 服务
   python xgb_single_v2_n_api.py serve
   python xgb_single_v2_n_api.py serve --port 9000
 
-API 示例:
-  GET /predict?start_date=2025-04-01&end_date=2025-04-14&station=北京市红十字血液中心&blood_type=ALL
-  GET /models
+API:
+  GET  /predict?start_date=2025-04-01&end_date=2025-06-30&station=北京市红十字血液中心&blood_type=ALL&date_type=month
+       date_type: day=按日(默认) | month=按月 | quarter=按季 | year=按年
+  GET  /models
   POST /train
 
 额外依赖 (在原有基础上):
@@ -39,20 +40,23 @@ from chinese_calendar import get_holiday_detail, Holiday
 from sklearn.metrics import mean_squared_error, root_mean_squared_error
 from xgboost import XGBRegressor
 
+# 数据列名 (CSV 中的中文列名)
 DATE_COL = "date"
 STATION_COL = "血站"
 BLOOD_COL = "血型"
 TARGET_COL = "总血量"
 
+# 文件路径: 模型保存目录 / 数据源目录 (支持环境变量覆盖)
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
 DATA_DIR = BASE_DIR.parent / "lstm" / "feature"
 
-BLOOD_CSV = os.environ.get("BLOOD_CSV", str(DATA_DIR / "all_data.csv"))
+BLOOD_CSV = os.environ.get("BLOOD_CSV", str(DATA_DIR / "remove_group_data.csv"))
 WEATHER_CSV = os.environ.get(
     "WEATHER_CSV", str(DATA_DIR / "blood_calendar_weather_2015_2026.csv")
 )
 
+# 北京大学校本部开学日期 (2015–2026), 用于生成"开学季"特征
 PKU_CLASS_STARTS = [
     date(2015, 9, 14),
     date(2016, 2, 22),
@@ -82,7 +86,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
+# ---------- 特征工程: 节假日 / 开学季 / 日历 ----------
+
+
 def is_pku_semester_start_season(d, pre_days=14, post_days=21) -> int:
+    """判断日期 d 是否落在北大开学季窗口 [开学前pre_days, 开学后post_days] 内."""
     d = pd.to_datetime(d).date()
     for s in PKU_CLASS_STARTS:
         if s - timedelta(days=pre_days) <= d <= s + timedelta(days=post_days):
@@ -91,6 +99,7 @@ def is_pku_semester_start_season(d, pre_days=14, post_days=21) -> int:
 
 
 def is_holiday_name(d, target: Holiday) -> int:
+    """判断日期 d 是否为指定的中国法定节假日 (春节/清明等)."""
     d = pd.to_datetime(d).date()
     try:
         _, hol = get_holiday_detail(d)
@@ -100,6 +109,7 @@ def is_holiday_name(d, target: Holiday) -> int:
 
 
 def add_cn_holiday_flags(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
+    """为 DataFrame 添加 is_spring_festival / is_qingming 二值列."""
     s = pd.to_datetime(df[date_col])
     df = df.copy()
     df["is_spring_festival"] = s.apply(
@@ -126,7 +136,11 @@ def add_calendar_features(df: pd.DataFrame, date_col: str = "date") -> pd.DataFr
     return df
 
 
+# ---------- 特征工程: 滞后/滚动统计 ----------
+
+
 def add_prev_rolling_sums(df: pd.DataFrame, windows=(1, 3, 7, 14, 28)) -> pd.DataFrame:
+    """计算前 N 日滚动采血量总和 (shift(1) 避免数据泄露)."""
     df = df.copy()
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
     min_date = df[DATE_COL].min()
@@ -144,6 +158,7 @@ def add_prev_rolling_sums(df: pd.DataFrame, windows=(1, 3, 7, 14, 28)) -> pd.Dat
 
 
 def add_dynamic_feature(g2: pd.DataFrame) -> pd.DataFrame:
+    """添加 lag / rolling_mean / rolling_std / ewm 等动态特征."""
     g2["lag1"] = g2[TARGET_COL].shift(1)
     g2["lag7"] = g2[TARGET_COL].shift(7)
     if "rolling7" not in g2.columns:
@@ -165,10 +180,12 @@ def add_dynamic_feature(g2: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_pred(pred):
+    """预测值下限裁剪到 0 并向下取整."""
     return np.array([max(0, math.floor(v)) for v in pred])
 
 
 def metric_item(true_y, pred_y) -> dict:
+    """计算 RMSE、平均误差率、各误差阈值达标比例."""
     result = {}
     result["rmse"] = float(root_mean_squared_error(true_y, pred_y))
     err_rates = []
@@ -195,13 +212,18 @@ def metric_item(true_y, pred_y) -> dict:
     return result
 
 
+# ---------- 数据加载 ----------
+
+
 def load_blood_data(path: str = BLOOD_CSV) -> pd.DataFrame:
+    """读取采血量 CSV, 返回含 date/血站/血型/总血量 列的 DataFrame."""
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"])
     return df
 
 
 def load_weather_data(path: str = WEATHER_CSV) -> pd.DataFrame:
+    """读取天气 CSV 并派生温度/天气 one-hot/节假日/开学季等特征."""
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"])
     df["temp_sq"] = df["平均温度"] ** 2
@@ -234,6 +256,9 @@ def _prepare_group_df(
 
 def group_name(station: str, blood_type: str) -> str:
     return f"{station}_{blood_type}"
+
+
+# ---------- 模型持久化: 保存/加载 XGBoost 模型 + 特征列 ----------
 
 
 def _group_dir(group: str) -> Path:
@@ -277,6 +302,9 @@ def list_saved_models() -> list:
             if d.is_dir() and (d / "model.json").exists()
         ]
     )
+
+
+# ---------- 训练: 按 (血站, 血型) 分组训练 XGBoost ----------
 
 
 def train_one_group(
@@ -406,6 +434,9 @@ def train_all(station: str = "北京市红十字血液中心", blood_types: list
     return results
 
 
+# ---------- 预测: 逐日递推 + 按粒度聚合 ----------
+
+
 def predict_date_range(
     station: str, blood_type: str, start_date: str, end_date: str
 ) -> list:
@@ -461,6 +492,31 @@ def predict_date_range(
     return predictions
 
 
+def aggregate_predictions(daily_preds: list, date_type: str) -> list:
+    """将逐日预测结果按 date_type 聚合: day=原样, month=按月, quarter=按季, year=按年."""
+    if date_type == "day" or not daily_preds:
+        return daily_preds
+
+    df = pd.DataFrame(daily_preds)
+    df["date"] = pd.to_datetime(df["date"])
+
+    period_map = {"month": "M", "quarter": "Q", "year": "Y"}
+    freq = period_map.get(date_type)
+    if freq is None:
+        return daily_preds
+
+    df["period"] = df["date"].dt.to_period(freq).astype(str)
+    agg = (
+        df.groupby("period", sort=True)
+        .agg(
+            predicted_volume=("predicted_volume", "sum"),
+            days=("predicted_volume", "count"),
+        )
+        .reset_index()
+    )
+    return agg.to_dict(orient="records")
+
+
 def create_app():
     from fastapi import FastAPI, Query, HTTPException
     from fastapi.responses import JSONResponse
@@ -481,17 +537,26 @@ def create_app():
         ),
         station: str = Query("北京市红十字血液中心", description="血站名称"),
         blood_type: str = Query("ALL", description="血型: ALL, A, B, O, AB"),
+        date_type: str = Query(
+            "day", description="聚合粒度: day=日, month=月, quarter=季, year=年"
+        ),
     ):
+        if date_type not in ("day", "month", "quarter", "year"):
+            raise HTTPException(
+                400, f"date_type 不合法: {date_type}，可选 day/month/quarter/year"
+            )
         grp = group_name(station, blood_type)
         if grp not in list_saved_models():
             raise HTTPException(404, f"模型不存在: {grp}，请先调用 POST /train 训练")
         try:
-            preds = predict_date_range(station, blood_type, start_date, end_date)
+            daily_preds = predict_date_range(station, blood_type, start_date, end_date)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        preds = aggregate_predictions(daily_preds, date_type)
         return {
             "station": station,
             "blood_type": blood_type,
+            "date_type": date_type,
             "start_date": start_date,
             "end_date": end_date,
             "count": len(preds),
