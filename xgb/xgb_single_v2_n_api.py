@@ -706,7 +706,7 @@ def create_app():
             "day", description="聚合粒度: day=日, month=月, quarter=季, year=年"
         ),
     ):
-        if date_type not in ("day", "month", "quarter", "year"):
+        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
             raise HTTPException(
                 400, f"date_type 不合法: {date_type}，可选 day/month/quarter/year"
             )
