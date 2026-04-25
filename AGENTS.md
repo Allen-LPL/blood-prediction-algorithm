@@ -11,7 +11,7 @@ xgb/            Standalone XGBoost models
 doc/            Patent drafts (Chinese, not code)
 ```
 
-All three consume prepared CSVs from `lstm/feature/` (the shared data hub).
+All three consume prepared CSVs from `lstm/feature/` (the shared data hub). The XGBoost API (`xgb/xgb_single_v2_n_api.py`) also supports reading from MySQL database.
 
 ## Critical: Working Directory
 
@@ -61,6 +61,7 @@ Use the latest stable script in each directory unless the user specifies otherwi
 | `lstm/` | `blood_lstm_xgb_v6(weight).py` | argparse |
 | `lstm_cnn/` | `train_2025_forecast.py` | argparse |
 | `xgb/` | `xgb_single_v2_n.py` | argparse |
+| `xgb/` | `xgb_single_v2_n_api.py` | argparse (train/train-collection/train-supply/serve) |
 
 Older `lstm/` scripts (v1–v4) use hardcoded module constants instead of argparse. `blood_lstm_xgb_v3_2.py` is the baseline reference.
 
@@ -81,11 +82,29 @@ python train_2025_forecast.py \
 
 ```
 numpy pandas matplotlib scikit-learn tensorflow xgboost chinese_calendar joblib seaborn
+sqlalchemy pymysql fastapi uvicorn
 ```
 
 `chinese_calendar` provides `is_holiday`, `get_holiday_detail`, and `Holiday` enum for Chinese public holidays.
 
+`sqlalchemy` + `pymysql` are required by the XGBoost API service for DB-backed training and prediction.
+
 Recommended: use a virtualenv. The `1_prepare_data.py` footer references `~/tf_arm_env/bin/activate`.
+
+## Database Configuration (XGBoost API)
+
+The XGBoost API service (`xgb/xgb_single_v2_n_api.py`) reads from MySQL when using `/train/collection` or `/train/supply` endpoints.
+
+Required environment variables:
+```bash
+export BLOOD_DB_USER="your_username"
+export BLOOD_DB_PASSWORD="your_password"
+export BLOOD_DB_HOST="101.37.104.90"   # default
+export BLOOD_DB_PORT="13306"            # default
+export BLOOD_DB_NAME="blood"            # default
+```
+
+DB tables used: `blood_collection_fact` (采血), `blood_supply_fact` (供血).
 
 ## Platform Quirk: Chinese Font
 
@@ -103,7 +122,8 @@ This will crash on Linux. `lstm_cnn/train_2025_forecast.py` is the only script t
 - **Holiday features**: `chinese_calendar` only covers 2004–2026. Scripts using `get_holiday_detail` will fail for dates outside this range.
 - **Station filtering**: Most training scripts filter to `北京市红十字血液中心` (Beijing Red Cross Blood Center). Check before assuming multi-station support.
 - **Blood type loop**: Training iterates over `["ALL", "A", "B", "O", "AB"]`. `"ALL"` aggregates all types by summing.
-- **Duplicate utilities**: `is_pku_semester_start_season`, `is_holiday_name`, `add_cn_holiday_flags` are copy-pasted across `lstm/v5`, `lstm/v6`, `xgb/xgb_single_v1.py`, `xgb/xgb_single_v2_n.py`. Changes must be applied to all copies.
+- **Duplicate utilities**: `is_pku_semester_start_season`, `is_holiday_name`, `add_cn_holiday_flags` are copy-pasted across `lstm/v5`, `lstm/v6`, `xgb/xgb_single_v1.py`, `xgb/xgb_single_v2_n.py`. Changes must be applied to all copies. The XGBoost API (`xgb/xgb_single_v2_n_api.py`) now imports from `xgb/feature_pipeline.py` instead of duplicating.
+- **Supply product classification**: `xgb/product_category.py` maps `blood_product_name` to categories (红细胞类, 血小板类, 血浆类) via keyword matching. Edit `CATEGORY_RULES` to adjust classification.
 
 ## Output Directories
 
@@ -123,6 +143,7 @@ Do not commit model outputs. Only `lstm/patent_figures/` and `lstm/feature/` CSV
 python -m py_compile lstm/blood_lstm_xgb_v5\(resid\).py
 python -m py_compile lstm_cnn/train_2025_forecast.py
 python -m py_compile xgb/xgb_single_v2_n.py
+python -m py_compile xgb/xgb_single_v2_n_api.py
 ```
 
 No test suite exists. Use `py_compile` to verify syntax after edits.
