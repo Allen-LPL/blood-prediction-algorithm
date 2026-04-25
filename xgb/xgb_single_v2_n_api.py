@@ -543,13 +543,13 @@ def predict_supply_range(
 
 def aggregate_predictions(daily_preds: list, date_type: str) -> list:
     """将逐日预测结果按 date_type 聚合: day=原样, month=按月, quarter=按季, year=按年."""
-    if date_type == "day" or not daily_preds:
+    if date_type == "DAY" or not daily_preds:
         return daily_preds
 
     df = pd.DataFrame(daily_preds)
     df["date"] = pd.to_datetime(df["date"])
 
-    period_map = {"month": "M", "quarter": "Q", "year": "Y"}
+    period_map = {"MONTH": "M", "QUARTER": "Q", "YEAR": "Y"}
     freq = period_map.get(date_type)
     if freq is None:
         return daily_preds
@@ -648,28 +648,69 @@ def create_app():
         start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         station: str = Query("北京市红十字血液中心"),
-        blood_type: str = Query("ALL"),
-        date_type: str = Query("day"),
+        blood_types: str = Query("ALL", description="逗号分隔血型, 如 ALL,A,B,O,AB"),
+        date_type: str = Query(
+            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
+        ),
     ):
-        grp = collection_group_name(station, blood_type)
-        if grp not in list_saved_models():
-            # fallback to legacy name
-            grp = group_name(station, blood_type)
-            if grp not in list_saved_models():
-                raise HTTPException(404, f"模型不存在: {grp}")
-        try:
-            daily_preds = predict_date_range(station, blood_type, start_date, end_date)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        preds = aggregate_predictions(daily_preds, date_type)
+        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
+            raise HTTPException(
+                400, f"date_type 不合法: {date_type}，可选 DAY/MONTH/QUARTER/YEAR"
+            )
+
+        bt_list = [b.strip() for b in blood_types.split(",") if b.strip()]
+        if not bt_list:
+            raise HTTPException(400, "blood_types 不能为空")
+
+        saved = list_saved_models()
+        results_by_type = []
+
+        for bt in bt_list:
+            grp = collection_group_name(station, bt)
+            if grp not in saved:
+                # fallback to legacy name
+                grp = group_name(station, bt)
+                if grp not in saved:
+                    results_by_type.append(
+                        {
+                            "blood_type": bt,
+                            "group": grp,
+                            "error": f"模型不存在: {grp}，请先训练",
+                            "predictions": [],
+                        }
+                    )
+                    continue
+
+            try:
+                daily_preds = predict_date_range(station, bt, start_date, end_date)
+                preds = aggregate_predictions(daily_preds, date_type)
+            except ValueError as e:
+                results_by_type.append(
+                    {
+                        "blood_type": bt,
+                        "group": grp,
+                        "error": str(e),
+                        "predictions": [],
+                    }
+                )
+                continue
+
+            results_by_type.append(
+                {
+                    "blood_type": bt,
+                    "group": grp,
+                    "count": len(preds),
+                    "predictions": preds,
+                }
+            )
+
         return {
             "business": "collection",
-            "group": grp,
+            "station": station,
             "date_type": date_type,
             "start_date": start_date,
             "end_date": end_date,
-            "count": len(preds),
-            "predictions": preds,
+            "blood_types": results_by_type,
         }
 
     # ---- 供血训练 + 预测 ----
@@ -703,12 +744,12 @@ def create_app():
         start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         date_type: str = Query(
-            "day", description="聚合粒度: day=日, month=月, quarter=季, year=年"
+            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
         ),
     ):
         if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
             raise HTTPException(
-                400, f"date_type 不合法: {date_type}，可选 day/month/quarter/year"
+                400, f"date_type 不合法: {date_type}，可选 DAY/MONTH/QUARTER/YEAR"
             )
         if scope == "org" and not org:
             raise HTTPException(400, "scope='org' requires org parameter")
@@ -806,12 +847,12 @@ def create_app():
         station: str = Query("北京市红十字血液中心", description="血站名称"),
         blood_type: str = Query("ALL", description="血型: ALL, A, B, O, AB"),
         date_type: str = Query(
-            "day", description="聚合粒度: day=日, month=月, quarter=季, year=年"
+            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
         ),
     ):
-        if date_type not in ("day", "month", "quarter", "year"):
+        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
             raise HTTPException(
-                400, f"date_type 不合法: {date_type}，可选 day/month/quarter/year"
+                400, f"date_type 不合法: {date_type}，可选 DAY/MONTH/QUARTER/YEAR"
             )
         grp = group_name(station, blood_type)
         if grp not in list_saved_models():
