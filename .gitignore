@@ -12,3 +12,7 @@ lstm/patent_figures/
 xgb/__pycache__/
 .history/
 doc/
+lstm/__pycache__/
+lstm/patent_figures.zip
+tests/__pycache__/
+docs/
