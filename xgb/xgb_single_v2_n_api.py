@@ -206,6 +206,42 @@ def _load_weather_features(include_pku: bool = True) -> pd.DataFrame:
     return df
 
 
+# ---------- 连续段感知的特征工程 ----------
+
+
+def _segment_aware_features(df: pd.DataFrame) -> pd.DataFrame:
+    """按连续日期段独立做 rolling/dynamic 特征,避免在跨段(如疫情年被剔除)时
+    把零填充泄露到 rolling 统计里.
+
+    检测 date diff > 1 即视为新段;每段独立调 add_prev_rolling_sums + add_dynamic_feature
+    后再拼回.
+    """
+    if df.empty:
+        return df
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
+    if len(df) == 1:
+        df = add_prev_rolling_sums(df, windows=(1, 3, 7, 14, 28))
+        return add_dynamic_feature(df)
+
+    gap = df[DATE_COL].diff().dt.days.fillna(1)
+    seg_id = (gap > 1).cumsum()
+    out = []
+    for _, seg_df in df.groupby(seg_id, sort=False, group_keys=False):
+        seg_df = add_prev_rolling_sums(seg_df.copy(), windows=(1, 3, 7, 14, 28))
+        seg_df = add_dynamic_feature(seg_df)
+        out.append(seg_df)
+    return pd.concat(out, ignore_index=True)
+
+
+def _filter_skip_years(df: pd.DataFrame, skip_years: Optional[list]) -> pd.DataFrame:
+    """从 df 中删除年份在 skip_years 中的行 (用于训练时排除疫情封控期等异常时段)."""
+    if not skip_years:
+        return df
+    skip_set = set(int(y) for y in skip_years)
+    mask = ~pd.to_datetime(df[DATE_COL]).dt.year.isin(skip_set)
+    return df.loc[mask].copy()
+
+
 # ---------- 训练: 按 (血站, 血型) 分组训练 XGBoost ----------
 
 
@@ -217,13 +253,25 @@ def train_one_group(
     business: str,
     include_pku: bool,
     train_lstm: bool = True,
+    skip_years: Optional[list] = None,
 ) -> dict:
-    """训练一个 group: XGBoost → 5 折 OOF 残差 → BiLSTM 残差校正,保存所有工件."""
+    """训练一个 group: XGBoost → 5 折 OOF 残差 → BiLSTM 残差校正,保存所有工件.
+
+    skip_years: 训练时跳过的年份列表 (如 [2019, 2020, 2021] 排除疫情封控).
+    跨年的滚动统计会按连续段独立计算,不会把跳过年份当作 0 填进 rolling.
+    """
     label_col = "label_tplus1"
     test_ratio = 0.1
 
-    group_blood_df = add_prev_rolling_sums(group_blood_df, windows=(1, 3, 7, 14, 28))
-    group_blood_df = add_dynamic_feature(group_blood_df)
+    if skip_years:
+        before = len(group_blood_df)
+        group_blood_df = _filter_skip_years(group_blood_df, skip_years)
+        log.info(
+            "[%s] skip_years=%s, %d → %d 行",
+            group, skip_years, before, len(group_blood_df),
+        )
+
+    group_blood_df = _segment_aware_features(group_blood_df)
     group_blood_df[label_col] = group_blood_df[TARGET_COL]
     group_blood_df = group_blood_df.dropna(subset=[label_col])
 
@@ -410,15 +458,24 @@ def train_one_group(
 # ---------- 采血训练 ----------
 
 
+DEFAULT_SKIP_YEARS = [2019, 2020, 2021]
+
+
 def train_collection(
     station: str = "北京市红十字血液中心",
     blood_types: Optional[list] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    skip_years: Optional[list] = None,
 ) -> list:
-    """训练采血模型 (始终从数据库加载,XGB + LSTM 残差)."""
+    """训练采血模型 (始终从数据库加载,XGB + LSTM 残差).
+
+    skip_years: 训练跳过的年份,默认 [2019,2020,2021] 疫情封控期;传 [] 关闭跳过.
+    """
     if blood_types is None:
         blood_types = ["ALL", "A", "B", "O", "AB"]
+    if skip_years is None:
+        skip_years = DEFAULT_SKIP_YEARS
 
     engine = get_engine()
     all_blood_df = load_collection_daily(
@@ -435,7 +492,9 @@ def train_collection(
             log.warning("[%s] 无数据, 跳过", grp)
             continue
         metrics = train_one_group(
-            grp, grp_df, weather_df, business="collection", include_pku=True
+            grp, grp_df, weather_df,
+            business="collection", include_pku=True,
+            skip_years=skip_years,
         )
         results.append(metrics)
 
@@ -452,10 +511,16 @@ def train_supply(
     orgs: Optional[list] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    skip_years: Optional[list] = None,
 ) -> list:
-    """训练供血模型 (从数据库)."""
+    """训练供血模型 (从数据库).
+
+    skip_years: 训练跳过的年份,默认 [2019,2020,2021] 疫情封控期;传 [] 关闭跳过.
+    """
     if categories is None:
         categories = ALL_CATEGORIES
+    if skip_years is None:
+        skip_years = DEFAULT_SKIP_YEARS
 
     engine = get_engine()
     weather_df = _load_weather_features(include_pku=False)
@@ -472,7 +537,9 @@ def train_supply(
                 log.warning("[%s] 无数据, 跳过", grp)
                 continue
             metrics = train_one_group(
-                grp, grp_df, weather_df, business="supply", include_pku=False
+                grp, grp_df, weather_df,
+                business="supply", include_pku=False,
+                skip_years=skip_years,
             )
             results.append(metrics)
     else:
@@ -494,7 +561,9 @@ def train_supply(
                     log.warning("[%s] 无数据, 跳过", grp)
                     continue
                 metrics = train_one_group(
-                    grp, grp_df, weather_df, business="supply", include_pku=False
+                    grp, grp_df, weather_df,
+                    business="supply", include_pku=False,
+                    skip_years=skip_years,
                 )
                 results.append(metrics)
 
@@ -832,13 +901,19 @@ def create_app():
         blood_types: str = Query("ALL,A,B,O,AB"),
         start_date: str = Query(None),
         end_date: str = Query(None),
+        skip_years: str = Query(
+            "2019,2020,2021",
+            description="逗号分隔训练时跳过的年份 (默认排除疫情封控期);传空字符串关闭",
+        ),
     ):
         bt_list = [x.strip() for x in blood_types.split(",") if x.strip()]
+        skip_y = [int(y.strip()) for y in skip_years.split(",") if y.strip()] if skip_years else []
         results = train_collection(
             station=station,
             blood_types=bt_list,
             start_date=start_date,
             end_date=end_date,
+            skip_years=skip_y,
         )
         return {"trained": len(results), "results": results}
 
@@ -921,15 +996,21 @@ def create_app():
         orgs: str = Query(None),
         start_date: str = Query(None),
         end_date: str = Query(None),
+        skip_years: str = Query(
+            "2019,2020,2021",
+            description="逗号分隔训练时跳过的年份 (默认排除疫情封控期);传空字符串关闭",
+        ),
     ):
         cat_list = [x.strip() for x in categories.split(",") if x.strip()]
         org_list = [x.strip() for x in orgs.split(",") if x.strip()] if orgs else None
+        skip_y = [int(y.strip()) for y in skip_years.split(",") if y.strip()] if skip_years else []
         results = train_supply(
             scope=scope,
             categories=cat_list,
             orgs=org_list,
             start_date=start_date,
             end_date=end_date,
+            skip_years=skip_y,
         )
         return {"trained": len(results), "results": results}
 
@@ -1051,6 +1132,10 @@ def main():
     train_c.add_argument("--blood_types", default="ALL,A,B,O,AB")
     train_c.add_argument("--start_date", default=None)
     train_c.add_argument("--end_date", default=None)
+    train_c.add_argument(
+        "--skip_years", default="2019,2020,2021",
+        help="训练跳过的年份(默认疫情封控期);传空字符串关闭",
+    )
 
     # 供血训练 (DB)
     train_s = sub.add_parser("train-supply", help="Train supply models from DB")
@@ -1059,6 +1144,10 @@ def main():
     train_s.add_argument("--orgs", default=None)
     train_s.add_argument("--start_date", default=None)
     train_s.add_argument("--end_date", default=None)
+    train_s.add_argument(
+        "--skip_years", default="2019,2020,2021",
+        help="训练跳过的年份(默认疫情封控期);传空字符串关闭",
+    )
 
     # API 服务
     serve_p = sub.add_parser("serve", help="启动 FastAPI 预测服务")
@@ -1069,11 +1158,16 @@ def main():
 
     if args.mode == "train-collection":
         bt_list = [x.strip() for x in args.blood_types.split(",") if x.strip()]
+        skip_y = (
+            [int(y.strip()) for y in args.skip_years.split(",") if y.strip()]
+            if args.skip_years else []
+        )
         results = train_collection(
             station=args.station,
             blood_types=bt_list,
             start_date=args.start_date,
             end_date=args.end_date,
+            skip_years=skip_y,
         )
         print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
     elif args.mode == "train-supply":
@@ -1083,12 +1177,17 @@ def main():
             if args.orgs
             else None
         )
+        skip_y = (
+            [int(y.strip()) for y in args.skip_years.split(",") if y.strip()]
+            if args.skip_years else []
+        )
         results = train_supply(
             scope=args.scope,
             categories=cat_list,
             orgs=org_list,
             start_date=args.start_date,
             end_date=args.end_date,
+            skip_years=skip_y,
         )
         print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
     elif args.mode == "serve":

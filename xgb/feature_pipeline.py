@@ -125,24 +125,34 @@ def add_prev_rolling_sums(df: pd.DataFrame, windows=(1, 3, 7, 14, 28)) -> pd.Dat
 
 
 def add_dynamic_feature(g2: pd.DataFrame) -> pd.DataFrame:
-    """添加 lag / rolling_mean / rolling_std / ewm 等动态特征."""
+    """添加 lag / rolling_mean / rolling_std / ewm 等动态特征.
+
+    所有滚动/EWM 统计都基于 lag1 (前一天及更早), 避免把当天 target 泄露到特征中.
+    在递推预测时, 这保证训练集和推理集的特征分布一致.
+    """
     g2["lag1"] = g2[TARGET_COL].shift(1)
     g2["lag7"] = g2[TARGET_COL].shift(7)
-    if "rolling7" not in g2.columns:
-        g2["rolling7"] = g2[TARGET_COL].rolling(7).mean()
-    g2["absdiff1"] = (g2[TARGET_COL] - g2["lag1"]).abs()
-    g2["rolling_std7"] = g2[TARGET_COL].rolling(7).std()
-    g2["rolling_std14"] = g2[TARGET_COL].rolling(14).std()
-    g2["rolling_absdiff7"] = g2["absdiff1"].rolling(7).mean()
     g2["lag14"] = g2[TARGET_COL].shift(14)
     g2["lag28"] = g2[TARGET_COL].shift(28)
-    g2["absdiff7"] = (g2[TARGET_COL] - g2["lag7"]).abs()
-    g2["diff7"] = g2[TARGET_COL] - g2["lag7"]
-    g2["diff14"] = g2[TARGET_COL] - g2["lag14"]
-    g2["rolling14"] = g2[TARGET_COL].rolling(14).mean()
-    g2["rolling28"] = g2[TARGET_COL].rolling(28).mean()
-    g2["ewm7"] = g2[TARGET_COL].ewm(span=7, adjust=False).mean()
-    g2["ewm14"] = g2[TARGET_COL].ewm(span=14, adjust=False).mean()
+
+    # 所有滚动/EWM 统计都从 lag1 (即 shift(1) 后的序列) 出发, 严格避免泄露
+    base = g2["lag1"]  # 截至 t-1 的序列
+    if "rolling7" not in g2.columns:
+        g2["rolling7"] = base.rolling(7, min_periods=1).mean()
+    g2["rolling14"] = base.rolling(14, min_periods=1).mean()
+    g2["rolling28"] = base.rolling(28, min_periods=1).mean()
+    g2["rolling_std7"] = base.rolling(7, min_periods=2).std()
+    g2["rolling_std14"] = base.rolling(14, min_periods=2).std()
+    g2["ewm7"] = base.ewm(span=7, adjust=False).mean()
+    g2["ewm14"] = base.ewm(span=14, adjust=False).mean()
+
+    # 差分类特征也基于 lag (历史信号), 不含当天 target
+    g2["absdiff1"] = (g2["lag1"] - g2["lag1"].shift(1)).abs()
+    g2["absdiff7"] = (g2["lag1"] - g2["lag7"]).abs()
+    g2["diff7"] = g2["lag1"] - g2["lag7"]
+    g2["diff14"] = g2["lag1"] - g2["lag14"]
+    g2["rolling_absdiff7"] = g2["absdiff1"].rolling(7, min_periods=1).mean()
+
     return g2
 
 
