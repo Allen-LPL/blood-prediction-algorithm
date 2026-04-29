@@ -837,7 +837,6 @@ def create_app():
         results = train_collection(
             station=station,
             blood_types=bt_list,
-            use_db=True,
             start_date=start_date,
             end_date=end_date,
         )
