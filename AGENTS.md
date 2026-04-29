@@ -11,7 +11,7 @@ xgb/            Standalone XGBoost models
 doc/            Patent drafts (Chinese, not code)
 ```
 
-All three consume prepared CSVs from `lstm/feature/` (the shared data hub). The XGBoost API (`xgb/xgb_single_v2_n_api.py`) also supports reading from MySQL database.
+`lstm/` and `lstm_cnn/` consume prepared CSVs from `lstm/feature/` (the shared data hub). The XGBoost API (`xgb/xgb_single_v2_n_api.py`) reads exclusively from the MySQL database for both training and prediction; CSV-backed training was removed. It also adds a BiLSTM residual head on top of XGBoost (`y_hat_adaptive = y_xgb + clip(resid_pred, ±0.5·|y_xgb|)`).
 
 ## Critical: Working Directory
 
@@ -61,7 +61,7 @@ Use the latest stable script in each directory unless the user specifies otherwi
 | `lstm/` | `blood_lstm_xgb_v6(weight).py` | argparse |
 | `lstm_cnn/` | `train_2025_forecast.py` | argparse |
 | `xgb/` | `xgb_single_v2_n.py` | argparse |
-| `xgb/` | `xgb_single_v2_n_api.py` | argparse (train/train-collection/train-supply/serve) |
+| `xgb/` | `xgb_single_v2_n_api.py` | argparse (train-collection/train-supply/serve) |
 
 Older `lstm/` scripts (v1–v4) use hardcoded module constants instead of argparse. `blood_lstm_xgb_v3_2.py` is the baseline reference.
 
@@ -134,6 +134,7 @@ This will crash on Linux. `lstm_cnn/train_2025_forecast.py` is the only script t
 | `lstm_cnn/train_v1` | `lstm_cnn/out_group_models/` | per-group: `best_model.keras`, `metrics.json`, predictions CSV |
 | `lstm_cnn/train_v2` | `lstm_cnn/out_group_models_v2/` | same structure |
 | `lstm_cnn/train_2025_forecast` | `lstm_cnn/out_group_models_2025_forecast/` | same + `metrics_summary.json` |
+| `xgb/xgb_single_v2_n_api` | `xgb/models/{group}/` | `model.json` + `feat_cols.json` (XGB), `lstm.keras` + `feature_scaler.joblib` + `resid_scaler.joblib` + `lstm_meta.json` (BiLSTM 残差头) |
 
 Do not commit model outputs. Only `lstm/patent_figures/` and `lstm/feature/` CSVs are intentionally tracked.
 

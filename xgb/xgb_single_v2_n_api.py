@@ -1,50 +1,43 @@
 """
-XGBoost 采血量 + 供血量预测 — 模型持久化 + API 服务 (双业务版)
+XGBoost + LSTM-残差 采血/供血预测 — 模型持久化 + API 服务
 
-基于 xgb_single_v2_n.py 的算法逻辑，增加:
-  1. 训练后将 XGBoost 模型 + 特征列表持久化到 xgb/models/
-  2. FastAPI 接口：接受时间范围参数，递推预测并返回 JSON
-  3. 采血 (collection) + 供血 (supply) 双业务支持
+特性:
+  1. 训练: XGBoost → 5 折 OOF 残差 → BiLSTM 残差校正
+     输出 y_hat_adaptive = y_xgb + clip(resid_pred, ±0.5·|y_xgb|)
+  2. 数据源统一为 MySQL (data_source.py + db_config.py)
+  3. 模型工件目录: xgb/models/{group}/
+       model.json + feat_cols.json (XGB)
+       lstm.keras + feature_scaler.joblib + resid_scaler.joblib + lstm_meta.json (LSTM)
 
 运行 (CWD 必须是 xgb/):
   cd xgb
 
-  # 训练并保存模型 (旧版 CSV 方式, 向后兼容)
-  python xgb_single_v2_n_api.py train
-
-  # 训练采血模型 (从数据库)
+  # 训练采血模型
   python xgb_single_v2_n_api.py train-collection --station 北京市红十字血液中心
 
-  # 训练供血模型 (从数据库)
+  # 训练供血模型
   python xgb_single_v2_n_api.py train-supply --scope global
 
   # 启动 API 服务 (默认 0.0.0.0:8000)
-  python xgb_single_v2_n_api.py serve
   python xgb_single_v2_n_api.py serve --port 9000
 
 API:
-  GET  /predict?start_date=2025-04-01&end_date=2025-06-30&station=北京市红十字血液中心&blood_type=ALL&date_type=month
-       date_type: day=按日(默认) | month=按月 | quarter=按季 | year=按年
-  GET  /models
-  POST /train
-
-  # 新增端点
   GET  /health
   GET  /data/collection?start_date=...&end_date=...
   GET  /data/supply?scope=global&start_date=...&end_date=...
   POST /train/collection
   POST /train/supply
-  GET  /predict/collection
-  GET  /predict/supply
+  GET  /predict/collection?start_date=...&end_date=...&station=...&blood_types=ALL&date_type=DAY
+  GET  /predict/supply?scope=global&categories=红细胞类&start_date=...&end_date=...
+  GET  /models
 
-额外依赖 (在原有基础上):
-  pip install fastapi uvicorn sqlalchemy pymysql
+依赖:
+  pip install fastapi uvicorn sqlalchemy pymysql tensorflow joblib
 """
 
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -65,6 +58,22 @@ from feature_pipeline import (
 from db_config import get_engine, check_connection, get_masked_url
 from data_source import load_collection_daily, load_supply_daily
 from product_category import ALL_CATEGORIES
+from residual_lstm import (
+    LSTM_AUX_COLS_COLLECTION,
+    LSTM_AUX_COLS_SUPPLY,
+    LOOKBACK,
+    RESID_OUTPUT_CLIP_FRAC,
+    TF_AVAILABLE,
+    build_lstm_feature_frame,
+    clip_resid_pred,
+    clip_train_residuals,
+    compute_oof_y_xgb,
+    load_lstm_artifacts,
+    lstm_meta_payload,
+    predict_residual_for_window,
+    save_lstm_artifacts,
+    train_residual_lstm,
+)
 
 # 数据列名 (CSV 中的中文列名)
 DATE_COL = "date"
@@ -76,29 +85,12 @@ SUPPLY_TARGET_COL = "总供血量"
 SUPPLY_TYPE_COL = "供血类型"
 SUPPLY_ORG_COL = "发血机构"
 
-# 文件路径: 模型保存目录 / 数据源目录 (支持环境变量覆盖)
+# 文件路径: 模型保存目录
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
-DATA_DIR = BASE_DIR.parent / "lstm" / "feature"
-
-BLOOD_CSV = os.environ.get("BLOOD_CSV", str(DATA_DIR / "remove_group_data.csv"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-
-
-# ---------- 数据加载 (CSV 回退) ----------
-
-
-def load_blood_data_csv(path: str = BLOOD_CSV) -> pd.DataFrame:
-    """读取采血量 CSV, 返回含 date/血站/血型/总血量 列的 DataFrame."""
-    df = pd.read_csv(path)
-    df["date"] = pd.to_datetime(df["date"])
-    return df
-
-
-# 向后兼容别名
-load_blood_data = load_blood_data_csv
 
 
 # ---------- 分组数据准备 ----------
@@ -218,11 +210,16 @@ def _load_weather_features(include_pku: bool = True) -> pd.DataFrame:
 
 
 def train_one_group(
-    group: str, group_blood_df: pd.DataFrame, weather_df: pd.DataFrame
+    group: str,
+    group_blood_df: pd.DataFrame,
+    weather_df: pd.DataFrame,
+    *,
+    business: str,
+    include_pku: bool,
+    train_lstm: bool = True,
 ) -> dict:
-    """训练一个 station+blood_type 组合, 保存模型, 返回评估指标."""
+    """训练一个 group: XGBoost → 5 折 OOF 残差 → BiLSTM 残差校正,保存所有工件."""
     label_col = "label_tplus1"
-    final_valid_days = 14
     test_ratio = 0.1
 
     group_blood_df = add_prev_rolling_sums(group_blood_df, windows=(1, 3, 7, 14, 28))
@@ -231,27 +228,29 @@ def train_one_group(
     group_blood_df = group_blood_df.dropna(subset=[label_col])
 
     df = pd.merge(group_blood_df, weather_df, on="date", how="left")
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
+
+    # LSTM 预期的 dayofweek 列;天气 CSV 提供的是 "weekday".
+    if "dayofweek" not in df.columns and "weekday" in df.columns:
+        df["dayofweek"] = df["weekday"]
+
     feat_cols = [
         col
         for col in df.columns
         if col not in (TARGET_COL, label_col, DATE_COL, "date_x", "date_y", "lag1")
     ]
 
-    final_valid_start = df[DATE_COL].max() - pd.Timedelta(days=final_valid_days - 1)
-    df_final_valid = df[df[DATE_COL] >= final_valid_start].copy()
-    df_train_test = df[df[DATE_COL] < final_valid_start].copy()
-    test_size = max(1, int(len(df_train_test) * test_ratio))
-    df_train = df_train_test.iloc[:-test_size].copy()
-    df_test = df_train_test.iloc[-test_size:].copy()
+    test_size = max(1, int(len(df) * test_ratio))
+    df_train = df.iloc[:-test_size].copy()
+    df_test = df.iloc[-test_size:].copy()
+    cutoff_date = df_test[DATE_COL].min()
 
     log.info(
-        "[%s] train=%d, test=%d, final_valid=%d (%s ~ %s)",
+        "[%s] train=%d, test=%d, cutoff=%s",
         group,
         len(df_train),
         len(df_test),
-        len(df_final_valid),
-        df_final_valid[DATE_COL].min().date(),
-        df_final_valid[DATE_COL].max().date(),
+        cutoff_date.date() if hasattr(cutoff_date, "date") else cutoff_date,
     )
 
     X_train = df_train[feat_cols].values
@@ -272,6 +271,7 @@ def train_one_group(
         else:
             w = 3
         sample_weight.append(w)
+    sample_weight = np.asarray(sample_weight)
 
     params = dict(
         learning_rate=0.4,
@@ -286,40 +286,125 @@ def train_one_group(
         early_stopping_rounds=10,
         missing=0,
     )
-    model = XGBRegressor(**params)
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_test, y_test)],
-        sample_weight=sample_weight,
-        verbose=False,
-    )
 
-    pred_test = normalize_pred(model.predict(X_test))
-    test_metrics = metric_item(y_test, pred_test)
+    # 5 折 OOF 训练段 + final XGB 测试段
+    oof_train, pred_test_raw, xgb_final = compute_oof_y_xgb(
+        X_train, y_train, sample_weight, X_test, y_test, params, n_splits=5
+    )
+    pred_test_norm = normalize_pred(pred_test_raw)
+    test_metrics_xgb = metric_item(y_test, pred_test_norm)
     log.info(
-        "[%s] 测试集 RMSE=%.2f, 平均误差率=%.4f",
+        "[%s] XGB 测试集 RMSE=%.2f, 平均误差率=%.4f",
         group,
-        test_metrics["rmse"],
-        test_metrics["mean_error_rate"],
+        test_metrics_xgb["rmse"],
+        test_metrics_xgb["mean_error_rate"],
     )
 
-    new_df = df.copy()
-    for cur_date in df_final_valid[DATE_COL].unique():
-        cur_row = new_df[new_df[DATE_COL] == cur_date]
-        pred_val = normalize_pred(model.predict(cur_row[feat_cols].values))[0]
-        new_df.loc[new_df[DATE_COL] == cur_date, TARGET_COL] = pred_val
-        new_df = add_prev_rolling_sums(new_df, windows=(1, 3, 7, 14, 28))
-        new_df = add_dynamic_feature(new_df)
+    # 全序列 y_xgb (训练段 OOF + 测试段 final)
+    y_xgb_full = np.concatenate(
+        [normalize_pred(oof_train), normalize_pred(pred_test_raw)]
+    ).astype(np.float64)
+    df["y_xgb"] = y_xgb_full
+    df["resid"] = (df[TARGET_COL].astype(np.float64) - df["y_xgb"]).astype(np.float32)
 
-    save_group_model(group, model, feat_cols)
+    # 训练段残差按 [1, 99] 百分位裁剪
+    train_mask = (df[DATE_COL] < cutoff_date).values
+    test_mask = ~train_mask
+    train_resid_clipped, lo, hi = clip_train_residuals(
+        df.loc[train_mask, "resid"].to_numpy()
+    )
+    df.loc[train_mask, "resid"] = train_resid_clipped
 
-    return {
+    save_group_model(group, xgb_final, feat_cols)
+
+    result = {
         "group": group,
+        "business": business,
         "train_size": len(df_train),
         "test_size": len(df_test),
-        "test_metrics": test_metrics,
+        "test_metrics_xgb": test_metrics_xgb,
+        "lstm_trained": False,
     }
+
+    # LSTM 残差训练
+    if not train_lstm:
+        log.info("[%s] train_lstm=False,跳过 LSTM 残差训练", group)
+        return result
+    if not TF_AVAILABLE:
+        log.warning("[%s] tensorflow 不可用,仅保存 XGB", group)
+        return result
+
+    aux_cols = (
+        LSTM_AUX_COLS_COLLECTION if business == "collection" else LSTM_AUX_COLS_SUPPLY
+    )
+    feature_df, final_lstm_cols = build_lstm_feature_frame(df, aux_cols)
+    resid_target = df["resid"].to_numpy(dtype=np.float32)
+
+    lstm_artifacts = train_residual_lstm(
+        feature_df,
+        resid_target,
+        train_mask,
+        test_mask,
+        lookback=LOOKBACK,
+    )
+    if lstm_artifacts is None:
+        log.warning("[%s] LSTM 训练被跳过 (数据不足),仅保存 XGB", group)
+        return result
+
+    # 测试段评估: y_hat_adaptive = y_xgb + clip(resid_pred)
+    test_indices = lstm_artifacts["test_idx"]
+    if len(test_indices) > 0:
+        y_xgb_eval = df.loc[test_indices, "y_xgb"].to_numpy()
+        y_true_eval = df.loc[test_indices, TARGET_COL].to_numpy()
+        resid_pred_eval = lstm_artifacts["resid_pred_test"][test_indices]
+        resid_pred_clipped = clip_resid_pred(
+            resid_pred_eval, y_xgb_eval, frac=RESID_OUTPUT_CLIP_FRAC
+        )
+        y_hat_adaptive_eval = normalize_pred(y_xgb_eval + resid_pred_clipped)
+        test_metrics_adaptive = metric_item(y_true_eval, y_hat_adaptive_eval)
+        log.info(
+            "[%s] LSTM-adaptive 测试集 RMSE=%.2f (XGB %.2f), 平均误差率=%.4f (XGB %.4f)",
+            group,
+            test_metrics_adaptive["rmse"],
+            test_metrics_xgb["rmse"],
+            test_metrics_adaptive["mean_error_rate"],
+            test_metrics_xgb["mean_error_rate"],
+        )
+        result["test_metrics_adaptive"] = test_metrics_adaptive
+    else:
+        result["test_metrics_adaptive"] = None
+
+    meta = lstm_meta_payload(
+        lookback=LOOKBACK,
+        lstm_aux_cols=final_lstm_cols,
+        include_pku=include_pku,
+        train_resid_clip=(lo, hi),
+        business=business,
+        output_clip_frac=RESID_OUTPUT_CLIP_FRAC,
+        feature_dim=lstm_artifacts["feature_dim"],
+    )
+    save_lstm_artifacts(
+        _group_dir(group),
+        lstm_artifacts["lstm_model"],
+        lstm_artifacts["feature_scaler"],
+        lstm_artifacts["resid_scaler"],
+        meta,
+    )
+
+    history = lstm_artifacts.get("history")
+    val_loss_min = (
+        float(min(history.history["val_loss"]))
+        if history is not None and "val_loss" in history.history
+        else None
+    )
+    result["lstm_trained"] = True
+    result["lstm"] = {
+        "val_loss": val_loss_min,
+        "lookback": LOOKBACK,
+        "feature_dim": lstm_artifacts["feature_dim"],
+    }
+
+    return result
 
 
 # ---------- 采血训练 ----------
@@ -328,21 +413,17 @@ def train_one_group(
 def train_collection(
     station: str = "北京市红十字血液中心",
     blood_types: Optional[list] = None,
-    use_db: bool = True,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> list:
-    """训练采血模型 (支持 DB 或 CSV 数据源)."""
+    """训练采血模型 (始终从数据库加载,XGB + LSTM 残差)."""
     if blood_types is None:
         blood_types = ["ALL", "A", "B", "O", "AB"]
 
-    if use_db:
-        engine = get_engine()
-        all_blood_df = load_collection_daily(
-            engine, station=station, start_date=start_date, end_date=end_date
-        )
-    else:
-        all_blood_df = load_blood_data_csv()
+    engine = get_engine()
+    all_blood_df = load_collection_daily(
+        engine, station=station, start_date=start_date, end_date=end_date
+    )
 
     weather_df = _load_weather_features(include_pku=True)
 
@@ -353,7 +434,9 @@ def train_collection(
         if grp_df.empty:
             log.warning("[%s] 无数据, 跳过", grp)
             continue
-        metrics = train_one_group(grp, grp_df, weather_df)
+        metrics = train_one_group(
+            grp, grp_df, weather_df, business="collection", include_pku=True
+        )
         results.append(metrics)
 
     log.info("Collection training done, %d models saved to %s", len(results), MODEL_DIR)
@@ -388,7 +471,9 @@ def train_supply(
             if grp_df.empty:
                 log.warning("[%s] 无数据, 跳过", grp)
                 continue
-            metrics = train_one_group(grp, grp_df, weather_df)
+            metrics = train_one_group(
+                grp, grp_df, weather_df, business="supply", include_pku=False
+            )
             results.append(metrics)
     else:
         if not orgs:
@@ -408,24 +493,31 @@ def train_supply(
                 if grp_df.empty:
                     log.warning("[%s] 无数据, 跳过", grp)
                     continue
-                metrics = train_one_group(grp, grp_df, weather_df)
+                metrics = train_one_group(
+                    grp, grp_df, weather_df, business="supply", include_pku=False
+                )
                 results.append(metrics)
 
     log.info("Supply training done (scope=%s), %d models saved", scope, len(results))
     return results
 
 
-# ---------- 向后兼容: train_all ----------
-
-
-def train_all(
-    station: str = "北京市红十字血液中心", blood_types: Optional[list] = None
-) -> list:
-    """训练所有 group 并保存模型 (CSV 数据源, 向后兼容)."""
-    return train_collection(station=station, blood_types=blood_types, use_db=False)
-
-
 # ---------- 预测: 逐日递推 + 按粒度聚合 ----------
+
+
+def _resolve_collection_group(station: str, blood_type: str) -> str:
+    """解析采血模型 group 名: 优先新格式 collection__*,缺失时回退旧格式 station_blood."""
+    saved = set(list_saved_models())
+    primary = collection_group_name(station, blood_type)
+    if primary in saved:
+        return primary
+    legacy = group_name(station, blood_type)
+    if legacy in saved:
+        log.info("使用旧版命名模型: %s", legacy)
+        return legacy
+    raise FileNotFoundError(
+        f"模型不存在: 已查找 {primary} 和 {legacy},请先运行 train-collection"
+    )
 
 
 def predict_date_range(
@@ -433,18 +525,24 @@ def predict_date_range(
 ) -> list:
     """
     对指定 station + blood_type 在 [start_date, end_date] 范围内做逐日递推预测.
-    返回 [{"date": "2025-04-01", "predicted_volume": 42}, ...] 格式的 list.
+    数据从数据库加载;若该 group 训练过 LSTM 残差,会自动叠加 y_hat_adaptive.
+    返回 [{"date": "2025-04-01", "predicted_volume": 42}, ...].
     """
-    grp = group_name(station, blood_type)
+    grp = _resolve_collection_group(station, blood_type)
     model, feat_cols = load_group_model(grp)
+    lstm_pack = load_lstm_artifacts(_group_dir(grp))
 
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
     if end_dt < start_dt:
         raise ValueError(f"end_date ({end_date}) 不能早于 start_date ({start_date})")
 
-    all_blood_df = load_blood_data_csv()
-    weather_df = _load_weather_features(include_pku=True)
+    engine = get_engine()
+    include_pku = (
+        bool(lstm_pack["meta"].get("include_pku", True)) if lstm_pack else True
+    )
+    all_blood_df = load_collection_daily(engine, station=station, end_date=start_date)
+    weather_df = _load_weather_features(include_pku=include_pku)
     grp_df = _prepare_group_df(all_blood_df, station, blood_type)
 
     hist_df = grp_df[grp_df[DATE_COL] < start_dt].copy()
@@ -458,25 +556,125 @@ def predict_date_range(
     full_df = add_prev_rolling_sums(full_df, windows=(1, 3, 7, 14, 28))
     full_df = add_dynamic_feature(full_df)
     full_df["label_tplus1"] = full_df[TARGET_COL]
-
     full_df = pd.merge(full_df, weather_df, on="date", how="left")
+    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+        full_df["dayofweek"] = full_df["weekday"]
 
     # 补齐训练时的特征列 (天气 one-hot 可能不完全一致)
     for col in feat_cols:
         if col not in full_df.columns:
             full_df[col] = 0
 
+    predictions = _recursive_predict(
+        full_df=full_df,
+        pred_dates=pred_dates,
+        model=model,
+        feat_cols=feat_cols,
+        lstm_pack=lstm_pack,
+        start_dt=start_dt,
+    )
+    return predictions
+
+
+def _recursive_predict(
+    full_df: pd.DataFrame,
+    pred_dates: pd.DatetimeIndex,
+    model: XGBRegressor,
+    feat_cols: list,
+    lstm_pack: Optional[dict],
+    start_dt: pd.Timestamp,
+) -> list:
+    """逐日递推预测.若提供 lstm_pack,则在 XGB 输出基础上叠加 LSTM 残差校正."""
+    full_df = full_df.sort_values(DATE_COL).reset_index(drop=True)
+
+    use_lstm = lstm_pack is not None
+    if use_lstm:
+        lstm_meta = lstm_pack["meta"]
+        lstm_model = lstm_pack["lstm_model"]
+        feature_scaler = lstm_pack["feature_scaler"]
+        resid_scaler = lstm_pack["resid_scaler"]
+        lookback = int(lstm_meta["lookback"])
+        lstm_aux_cols = list(lstm_meta["lstm_aux_cols"])
+        clip_lo, clip_hi = lstm_meta.get("train_resid_clip", [-1e9, 1e9])
+        output_clip_frac = float(
+            lstm_meta.get("output_clip_frac", RESID_OUTPUT_CLIP_FRAC)
+        )
+
+        # 历史段一次性 y_xgb,据此计算历史残差并按训练时的百分位裁剪
+        hist_mask = full_df[DATE_COL] < start_dt
+        hist_y_xgb = normalize_pred(
+            model.predict(full_df.loc[hist_mask, feat_cols].values)
+        )
+        full_df.loc[hist_mask, "y_xgb"] = hist_y_xgb
+        full_df["y_xgb"] = full_df.get("y_xgb", pd.Series(0.0, index=full_df.index))
+
+        hist_resid = (
+            full_df.loc[hist_mask, TARGET_COL].astype(np.float64)
+            - full_df.loc[hist_mask, "y_xgb"].astype(np.float64)
+        ).clip(clip_lo, clip_hi)
+        # resid_lag1[s] = resid[s-1]
+        full_df["resid_lag1"] = 0.0
+        # 仅对历史段(含 start_dt 这一天的 resid_lag1)做 shift
+        resid_series = pd.Series(0.0, index=full_df.index, dtype=np.float64)
+        resid_series.loc[hist_mask] = hist_resid.values
+        full_df["resid_lag1"] = resid_series.shift(1).fillna(0.0).values
+    else:
+        lstm_meta = None
+        lstm_model = feature_scaler = resid_scaler = None
+        lookback = 0
+        lstm_aux_cols = []
+        output_clip_frac = RESID_OUTPUT_CLIP_FRAC
+
     predictions = []
     for cur_date in pred_dates:
-        cur_row = full_df[full_df[DATE_COL] == cur_date]
-        if cur_row.empty:
+        cur_mask = full_df[DATE_COL] == cur_date
+        if not cur_mask.any():
             continue
 
-        x = cur_row[feat_cols].values
-        pred_val = int(normalize_pred(model.predict(x))[0])
-        predictions.append({"date": str(cur_date.date()), "predicted_volume": pred_val})
+        x = full_df.loc[cur_mask, feat_cols].values
+        y_xgb = float(normalize_pred(model.predict(x))[0])
+        if use_lstm:
+            full_df.loc[cur_mask, "y_xgb"] = y_xgb
 
-        full_df.loc[full_df[DATE_COL] == cur_date, TARGET_COL] = pred_val
+        resid_pred_clipped = 0.0
+        if use_lstm:
+            window_start = cur_date - pd.Timedelta(days=lookback - 1)
+            window = (
+                full_df[
+                    (full_df[DATE_COL] >= window_start)
+                    & (full_df[DATE_COL] <= cur_date)
+                ]
+                .sort_values(DATE_COL)
+            )
+            if len(window) == lookback:
+                window_input = window.reindex(columns=lstm_aux_cols).fillna(0.0)
+                resid_pred = predict_residual_for_window(
+                    lstm_model,
+                    feature_scaler,
+                    resid_scaler,
+                    window_input,
+                    lookback,
+                )
+                resid_pred_clipped = float(
+                    clip_resid_pred(
+                        np.array([resid_pred]),
+                        np.array([y_xgb]),
+                        frac=output_clip_frac,
+                    )[0]
+                )
+
+        y_hat_arr = normalize_pred(np.array([y_xgb + resid_pred_clipped]))
+        y_hat = int(y_hat_arr[0])
+        predictions.append({"date": str(cur_date.date()), "predicted_volume": y_hat})
+
+        full_df.loc[cur_mask, TARGET_COL] = y_hat
+        if use_lstm:
+            next_date = cur_date + pd.Timedelta(days=1)
+            next_mask = full_df[DATE_COL] == next_date
+            if next_mask.any():
+                full_df.loc[next_mask, "resid_lag1"] = resid_pred_clipped
+
+        # 重算滚动/动态特征(LSTM aux 列 lag1, rolling7 也在此更新)
         full_df = add_prev_rolling_sums(full_df, windows=(1, 3, 7, 14, 28))
         full_df = add_dynamic_feature(full_df)
 
@@ -488,7 +686,7 @@ def predict_supply_range(
 ) -> list:
     """
     对指定供血类型在 [start_date, end_date] 范围内做逐日递推预测.
-    返回 [{"date": "2025-04-01", "predicted_volume": 42}, ...] 格式的 list.
+    数据从数据库加载;若该 group 训练过 LSTM 残差,会自动叠加 y_hat_adaptive.
     """
     if scope == "global":
         grp = supply_global_group_name(category)
@@ -498,6 +696,8 @@ def predict_supply_range(
         grp = supply_org_group_name(org, category)
 
     model, feat_cols = load_group_model(grp)
+    lstm_pack = load_lstm_artifacts(_group_dir(grp))
+
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
     if end_dt < start_dt:
@@ -519,25 +719,26 @@ def predict_supply_range(
     full_df = add_dynamic_feature(full_df)
     full_df["label_tplus1"] = full_df[TARGET_COL]
 
-    weather_df = _load_weather_features(include_pku=False)
+    include_pku = (
+        bool(lstm_pack["meta"].get("include_pku", False)) if lstm_pack else False
+    )
+    weather_df = _load_weather_features(include_pku=include_pku)
     full_df = pd.merge(full_df, weather_df, on="date", how="left")
+    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+        full_df["dayofweek"] = full_df["weekday"]
 
     for col in feat_cols:
         if col not in full_df.columns:
             full_df[col] = 0
 
-    predictions = []
-    for cur_date in pred_dates:
-        cur_row = full_df[full_df[DATE_COL] == cur_date]
-        if cur_row.empty:
-            continue
-        x = cur_row[feat_cols].values
-        pred_val = int(normalize_pred(model.predict(x))[0])
-        predictions.append({"date": str(cur_date.date()), "predicted_volume": pred_val})
-        full_df.loc[full_df[DATE_COL] == cur_date, TARGET_COL] = pred_val
-        full_df = add_prev_rolling_sums(full_df, windows=(1, 3, 7, 14, 28))
-        full_df = add_dynamic_feature(full_df)
-
+    predictions = _recursive_predict(
+        full_df=full_df,
+        pred_dates=pred_dates,
+        model=model,
+        feat_cols=feat_cols,
+        lstm_pack=lstm_pack,
+        start_dt=start_dt,
+    )
     return predictions
 
 
@@ -571,7 +772,6 @@ def aggregate_predictions(daily_preds: list, date_type: str) -> list:
 
 def create_app():
     from fastapi import FastAPI, Query, HTTPException
-    from fastapi.responses import JSONResponse
 
     app = FastAPI(
         title="血液预测 API",
@@ -834,59 +1034,6 @@ def create_app():
                 grouped["legacy"].append(m)
         return {"count": len(models), "models": grouped}
 
-    # ---- 旧版端点 (向后兼容, 标记 Deprecation) ----
-
-    @app.get("/predict")
-    def api_predict(
-        start_date: str = Query(
-            ..., description="开始日期, 如 2025-04-01", pattern=r"^\d{4}-\d{2}-\d{2}$"
-        ),
-        end_date: str = Query(
-            ..., description="结束日期, 如 2025-04-14", pattern=r"^\d{4}-\d{2}-\d{2}$"
-        ),
-        station: str = Query("北京市红十字血液中心", description="血站名称"),
-        blood_type: str = Query("ALL", description="血型: ALL, A, B, O, AB"),
-        date_type: str = Query(
-            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
-        ),
-    ):
-        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
-            raise HTTPException(
-                400, f"date_type 不合法: {date_type}，可选 DAY/MONTH/QUARTER/YEAR"
-            )
-        grp = group_name(station, blood_type)
-        if grp not in list_saved_models():
-            raise HTTPException(404, f"模型不存在: {grp}，请先调用 POST /train 训练")
-        try:
-            daily_preds = predict_date_range(station, blood_type, start_date, end_date)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        preds = aggregate_predictions(daily_preds, date_type)
-        response = JSONResponse(
-            content={
-                "station": station,
-                "blood_type": blood_type,
-                "date_type": date_type,
-                "start_date": start_date,
-                "end_date": end_date,
-                "count": len(preds),
-                "predictions": preds,
-            }
-        )
-        response.headers["Deprecation"] = "true"
-        return response
-
-    @app.post("/train")
-    def api_train(
-        station: str = Query("北京市红十字血液中心"),
-        blood_types: str = Query("ALL,A,B,O,AB", description="逗号分隔血型列表"),
-    ):
-        bt_list = [x.strip() for x in blood_types.split(",") if x.strip()]
-        results = train_all(station=station, blood_types=bt_list)
-        response = JSONResponse(content={"trained": len(results), "results": results})
-        response.headers["Deprecation"] = "true"
-        return response
-
     return app
 
 
@@ -898,13 +1045,6 @@ def main():
         description="XGBoost 血液预测: 训练模型 / 启动 API 服务 (双业务版)"
     )
     sub = parser.add_subparsers(dest="mode")
-
-    # 旧版训练 (CSV, 向后兼容)
-    train_p = sub.add_parser("train", help="训练全部采血模型并保存 (CSV 数据源)")
-    train_p.add_argument("--station", default="北京市红十字血液中心")
-    train_p.add_argument(
-        "--blood_types", default="ALL,A,B,O,AB", help="逗号分隔血型列表"
-    )
 
     # 采血训练 (DB)
     train_c = sub.add_parser("train-collection", help="Train collection models from DB")
@@ -928,16 +1068,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.mode == "train":
-        bt_list = [x.strip() for x in args.blood_types.split(",") if x.strip()]
-        results = train_all(station=args.station, blood_types=bt_list)
-        print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
-    elif args.mode == "train-collection":
+    if args.mode == "train-collection":
         bt_list = [x.strip() for x in args.blood_types.split(",") if x.strip()]
         results = train_collection(
             station=args.station,
             blood_types=bt_list,
-            use_db=True,
             start_date=args.start_date,
             end_date=args.end_date,
         )
