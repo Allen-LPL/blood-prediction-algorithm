@@ -24,6 +24,7 @@ SELECT
     SUM(base_unit_value)         AS `总血量`
 FROM blood_collection_fact
 WHERE blood_collection_time IS NOT NULL
+    and organization_mode in ('自愿献血', '个人无偿', '其他')
     {station_filter}
     {date_filter}
 GROUP BY DATE(blood_collection_time),
