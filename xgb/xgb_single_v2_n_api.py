@@ -956,6 +956,248 @@ def predict_supply_range(
     return predictions
 
 
+# ---------- 回测评估 (one-step-ahead with ground truth) ----------
+# 与 /predict/* 的关键区别:
+#   /predict: 递推未来,昨天的 lag1 = 昨天的预测值 → 误差累积 (真预测)
+#   /eval:    单步回测,昨天的 lag1 = 昨天的真实值 → 无误差累积 (调试/汇报)
+# /eval 等价于 lstm/blood_lstm_xgb_v5(resid).py 测试段评估的产出 (v5 那种 90% 拟合图).
+# 任何模型在这种设定下都会比真预测好看, 不能据此外推未来预测能力.
+
+
+def _one_step_evaluate(
+    full_df: pd.DataFrame,
+    eval_dates: list,
+    model: XGBRegressor,
+    feat_cols: list,
+    lstm_pack: Optional[dict],
+) -> list:
+    """单步回测: 每天用截至 t-1 的真实特征预测 t, 不递推.
+
+    full_df 必须包含 eval_dates 范围内的真实 TARGET_COL 值.
+    返回 [{date, predicted_volume, actual_volume, y_xgb, resid_pred, error, error_rate}, ...].
+    """
+    full_df = full_df.sort_values(DATE_COL).reset_index(drop=True)
+
+    # 一次性用 XGB 预测全序列 (特征已基于真实 lag, 无递推)
+    all_pred = normalize_pred(model.predict(full_df[feat_cols].values))
+    full_df["y_xgb"] = all_pred
+
+    use_lstm = lstm_pack is not None
+    if use_lstm:
+        lstm_meta = lstm_pack["meta"]
+        lstm_model = lstm_pack["lstm_model"]
+        feature_scaler = lstm_pack["feature_scaler"]
+        resid_scaler = lstm_pack["resid_scaler"]
+        lookback = int(lstm_meta["lookback"])
+        lstm_aux_cols = list(lstm_meta["lstm_aux_cols"])
+        clip_lo, clip_hi = lstm_meta.get("train_resid_clip", [-1e9, 1e9])
+        output_clip_frac = float(
+            lstm_meta.get("output_clip_frac", RESID_OUTPUT_CLIP_FRAC)
+        )
+        # resid_lag1 用真实残差的滞后 (训练时也是这样)
+        resid = (
+            full_df[TARGET_COL].astype(np.float64)
+            - full_df["y_xgb"].astype(np.float64)
+        ).clip(clip_lo, clip_hi)
+        full_df["resid_lag1"] = resid.shift(1).fillna(0.0).values
+    else:
+        lstm_meta = None
+        lstm_model = feature_scaler = resid_scaler = None
+        lookback = 0
+        lstm_aux_cols = []
+        output_clip_frac = RESID_OUTPUT_CLIP_FRAC
+
+    results = []
+    for cur_date in eval_dates:
+        cur_mask = full_df[DATE_COL] == cur_date
+        if not cur_mask.any():
+            continue
+        actual = float(full_df.loc[cur_mask, TARGET_COL].iloc[0])
+        y_xgb = float(full_df.loc[cur_mask, "y_xgb"].iloc[0])
+
+        resid_pred_clipped = 0.0
+        if use_lstm:
+            window_start = cur_date - pd.Timedelta(days=lookback - 1)
+            window = (
+                full_df[
+                    (full_df[DATE_COL] >= window_start)
+                    & (full_df[DATE_COL] <= cur_date)
+                ]
+                .sort_values(DATE_COL)
+            )
+            if len(window) == lookback:
+                window_input = window.reindex(columns=lstm_aux_cols).fillna(0.0)
+                resid_pred = predict_residual_for_window(
+                    lstm_model, feature_scaler, resid_scaler, window_input, lookback
+                )
+                resid_pred_clipped = float(
+                    clip_resid_pred(
+                        np.array([resid_pred]),
+                        np.array([y_xgb]),
+                        frac=output_clip_frac,
+                    )[0]
+                )
+
+        y_hat_arr = normalize_pred(np.array([y_xgb + resid_pred_clipped]))
+        y_hat = int(y_hat_arr[0])
+        err = y_hat - actual
+        err_rate = abs(err) / max(actual, 1e-6) if actual > 0 else 0.0
+
+        results.append({
+            "date": str(cur_date.date()),
+            "predicted_volume": y_hat,
+            "actual_volume": int(round(actual)),
+            "y_xgb": int(round(y_xgb)),
+            "resid_pred": int(round(resid_pred_clipped)),
+            "error": int(err),
+            "error_rate": round(err_rate, 4),
+        })
+
+    return results
+
+
+def _eval_summary(rows: list) -> dict:
+    """计算回测的汇总指标: MAE / MAPE / 误差分布."""
+    if not rows:
+        return {"sample_count": 0}
+    actuals = np.array([r["actual_volume"] for r in rows], dtype=float)
+    preds = np.array([r["predicted_volume"] for r in rows], dtype=float)
+    err = preds - actuals
+    abs_err = np.abs(err)
+    mae = float(np.mean(abs_err))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mape = float(np.mean(abs_err / np.maximum(actuals, 1e-6))) * 100
+    err_rates = abs_err / np.maximum(actuals, 1e-6)
+    return {
+        "sample_count": len(rows),
+        "mae": round(mae, 2),
+        "rmse": round(rmse, 2),
+        "mape_pct": round(mape, 2),
+        "within_10pct_ratio": round(float(np.mean(err_rates < 0.1)), 4),
+        "within_20pct_ratio": round(float(np.mean(err_rates < 0.2)), 4),
+        "within_30pct_ratio": round(float(np.mean(err_rates < 0.3)), 4),
+        "over_100pct_ratio": round(float(np.mean(err_rates > 1.0)), 4),
+        "actual_mean": round(float(actuals.mean()), 1),
+        "predicted_mean": round(float(preds.mean()), 1),
+        "actual_std": round(float(actuals.std()), 1),
+        "predicted_std": round(float(preds.std()), 1),
+    }
+
+
+def evaluate_date_range(
+    station: str, blood_type: str, start_date: str, end_date: str,
+    *,
+    all_blood_df: Optional[pd.DataFrame] = None,
+    weather_df: Optional[pd.DataFrame] = None,
+) -> dict:
+    """对采血做单步回测 (one-step-ahead).
+
+    返回 {"rows": [...], "summary": {...}}.
+    rows 每行包含真实值 + 预测值 + 误差.
+    """
+    grp = _resolve_collection_group(station, blood_type)
+    model, feat_cols = load_group_model(grp)
+    lstm_pack = load_lstm_artifacts(_group_dir(grp))
+
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    if end_dt < start_dt:
+        raise ValueError(f"end_date ({end_date}) 不能早于 start_date ({start_date})")
+
+    include_pku = (
+        bool(lstm_pack["meta"].get("include_pku", True)) if lstm_pack else True
+    )
+    if all_blood_df is None:
+        # eval 需要包含 eval 区间的真实 target, 所以拉到 end_dt
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        all_blood_df = load_collection_daily(
+            engine, station=station, start_date=hist_start, end_date=end_date,
+        )
+    if weather_df is None:
+        weather_df = _load_weather_features(include_pku=include_pku)
+
+    grp_df = _prepare_group_df(all_blood_df, station, blood_type)
+    if grp_df.empty:
+        raise ValueError(f"无 {station}/{blood_type} 数据")
+
+    grp_df = _segment_aware_features(grp_df)
+    grp_df["label_tplus1"] = grp_df[TARGET_COL]
+    grp_df = grp_df.dropna(subset=["label_tplus1"])
+
+    full_df = pd.merge(grp_df, weather_df, on="date", how="left")
+    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+        full_df["dayofweek"] = full_df["weekday"]
+    for col in feat_cols:
+        if col not in full_df.columns:
+            full_df[col] = 0
+
+    eval_dates = [
+        d for d in pd.date_range(start=start_dt, end=end_dt, freq="D")
+        if (full_df[DATE_COL] == d).any()
+    ]
+    rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
+    return {"rows": rows, "summary": _eval_summary(rows)}
+
+
+def evaluate_supply_range(
+    scope: str, category: str, start_date: str, end_date: str,
+    org: Optional[str] = None,
+    *,
+    supply_df: Optional[pd.DataFrame] = None,
+    weather_df: Optional[pd.DataFrame] = None,
+) -> dict:
+    """对供血做单步回测."""
+    if scope == "global":
+        grp = supply_global_group_name(category)
+    else:
+        if not org:
+            raise ValueError("scope='org' requires org parameter")
+        grp = supply_org_group_name(org, category)
+
+    model, feat_cols = load_group_model(grp)
+    lstm_pack = load_lstm_artifacts(_group_dir(grp))
+
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    if end_dt < start_dt:
+        raise ValueError(f"end_date ({end_date}) < start_date ({start_date})")
+
+    if supply_df is None:
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        supply_df = load_supply_daily(
+            engine, scope=scope, org=org, start_date=hist_start, end_date=end_date,
+        )
+
+    grp_df = _prepare_supply_group_df(supply_df, scope, category, org=org)
+    if grp_df.empty:
+        raise ValueError(f"无 {scope}/{category} 数据")
+
+    grp_df = _segment_aware_features(grp_df)
+    grp_df["label_tplus1"] = grp_df[TARGET_COL]
+    grp_df = grp_df.dropna(subset=["label_tplus1"])
+
+    include_pku = (
+        bool(lstm_pack["meta"].get("include_pku", False)) if lstm_pack else False
+    )
+    if weather_df is None:
+        weather_df = _load_weather_features(include_pku=include_pku)
+    full_df = pd.merge(grp_df, weather_df, on="date", how="left")
+    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+        full_df["dayofweek"] = full_df["weekday"]
+    for col in feat_cols:
+        if col not in full_df.columns:
+            full_df[col] = 0
+
+    eval_dates = [
+        d for d in pd.date_range(start=start_dt, end=end_dt, freq="D")
+        if (full_df[DATE_COL] == d).any()
+    ]
+    rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
+    return {"rows": rows, "summary": _eval_summary(rows)}
+
+
 def aggregate_predictions(daily_preds: list, date_type: str) -> list:
     """将逐日预测结果按 date_type 聚合: day=原样, month=按月, quarter=按季, year=按年."""
     if date_type == "DAY" or not daily_preds:
@@ -1286,6 +1528,153 @@ def create_app():
             "scope": scope,
             "org": org,
             "date_type": date_type,
+            "start_date": start_date,
+            "end_date": end_date,
+            "categories": results_by_category,
+        }
+
+    # ---- 回测端点 (one-step-ahead with ground truth, 调试/汇报用) ----
+
+    @app.get("/eval/collection")
+    def api_eval_collection(
+        start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        station: str = Query("北京市红十字血液中心"),
+        blood_types: str = Query("ALL", description="逗号分隔血型, 如 ALL,A,B,O,AB"),
+    ):
+        """**回测**: 用真实历史特征做单步预测, 等价 v5 的测试段评估.
+
+        与 /predict/collection 区别:
+          /predict: 真未来递推, 昨天的 lag1 = 昨天的预测值, 误差累积
+          /eval:    单步回测, 昨天的 lag1 = 昨天的真实值, 无误差累积
+        eval 的拟合度通常比 predict 高很多. 用于参数调优 / 模型对比 / 汇报.
+        **不能据此推断未来预测能力**.
+        """
+        bt_list = [b.strip() for b in blood_types.split(",") if b.strip()]
+        if not bt_list:
+            raise HTTPException(400, "blood_types 不能为空")
+
+        saved = list_saved_models()
+        results_by_type = []
+
+        start_dt = pd.to_datetime(start_date)
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        shared_blood_df = load_collection_daily(
+            engine, station=station, start_date=hist_start, end_date=end_date
+        )
+        shared_weather_df = _load_weather_features(include_pku=True)
+
+        for bt in bt_list:
+            grp = collection_group_name(station, bt)
+            if grp not in saved:
+                grp = group_name(station, bt)
+                if grp not in saved:
+                    results_by_type.append({
+                        "blood_type": bt, "group": grp,
+                        "error": f"模型不存在: {grp}, 请先训练",
+                        "rows": [], "summary": {},
+                    })
+                    continue
+
+            try:
+                eval_result = evaluate_date_range(
+                    station, bt, start_date, end_date,
+                    all_blood_df=shared_blood_df,
+                    weather_df=shared_weather_df,
+                )
+            except ValueError as e:
+                results_by_type.append({
+                    "blood_type": bt, "group": grp,
+                    "error": str(e), "rows": [], "summary": {},
+                })
+                continue
+
+            results_by_type.append({
+                "blood_type": bt,
+                "group": grp,
+                "rows": eval_result["rows"],
+                "summary": eval_result["summary"],
+            })
+
+        return {
+            "mode": "backtest_one_step_ahead",
+            "warning": "回测端点: 使用真实历史特征做单步预测, 不等同于 /predict 的真未来预测",
+            "business": "collection",
+            "station": station,
+            "start_date": start_date,
+            "end_date": end_date,
+            "blood_types": results_by_type,
+        }
+
+    @app.get("/eval/supply")
+    def api_eval_supply(
+        scope: str = Query("global"),
+        categories: str = Query(
+            ..., description="逗号分隔供血类型, 如 红细胞类,血小板类,血浆类"
+        ),
+        org: str = Query(None),
+        start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    ):
+        """**回测**: 供血单步评估. 与 /eval/collection 同义."""
+        if scope == "org" and not org:
+            raise HTTPException(400, "scope='org' requires org parameter")
+        cat_list = [c.strip() for c in categories.split(",") if c.strip()]
+        if not cat_list:
+            raise HTTPException(400, "categories 不能为空")
+
+        saved = list_saved_models()
+        results_by_category = []
+
+        start_dt = pd.to_datetime(start_date)
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        shared_supply_df = load_supply_daily(
+            engine, scope=scope, org=org, start_date=hist_start, end_date=end_date
+        )
+        shared_weather_df = _load_weather_features(include_pku=False)
+
+        for cat in cat_list:
+            if scope == "global":
+                grp = supply_global_group_name(cat)
+            else:
+                grp = supply_org_group_name(org, cat)
+
+            if grp not in saved:
+                results_by_category.append({
+                    "category": cat, "group": grp,
+                    "error": f"模型不存在: {grp}, 请先训练",
+                    "rows": [], "summary": {},
+                })
+                continue
+
+            try:
+                eval_result = evaluate_supply_range(
+                    scope, cat, start_date, end_date, org=org,
+                    supply_df=shared_supply_df,
+                    weather_df=shared_weather_df,
+                )
+            except ValueError as e:
+                results_by_category.append({
+                    "category": cat, "group": grp,
+                    "error": str(e), "rows": [], "summary": {},
+                })
+                continue
+
+            results_by_category.append({
+                "category": cat,
+                "group": grp,
+                "rows": eval_result["rows"],
+                "summary": eval_result["summary"],
+            })
+
+        return {
+            "mode": "backtest_one_step_ahead",
+            "warning": "回测端点: 使用真实历史特征做单步预测, 不等同于 /predict 的真未来预测",
+            "business": "supply",
+            "scope": scope,
+            "org": org,
             "start_date": start_date,
             "end_date": end_date,
             "categories": results_by_category,
