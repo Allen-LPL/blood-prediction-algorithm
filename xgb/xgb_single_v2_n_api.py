@@ -322,18 +322,31 @@ def train_one_group(
     sample_weight = np.asarray(sample_weight)
 
     params = dict(
-        learning_rate=0.4,
-        n_estimators=100,
-        min_child_weight=1,
-        subsample=0.9,
-        colsample_bytree=0.9,
+        learning_rate=0.05,       # 0.4 → 0.05
+        n_estimators=200,         # 100 → 200
+        max_depth=4,              # 8 → 4
+        min_child_weight=3,       # 1 → 3
+        subsample=0.8,            # 0.9 → 0.8
+        colsample_bytree=0.8,     # 0.9 → 0.8
         scale_pos_weight=1,
         seed=1024,
-        max_depth=8,
         eval_metric=mean_squared_error,
-        early_stopping_rounds=10,
+        early_stopping_rounds=20, # 10 → 20
         missing=0,
     )
+    # params = dict(
+    #     learning_rate=0.4,
+    #     n_estimators=100,
+    #     min_child_weight=1,
+    #     subsample=0.9,
+    #     colsample_bytree=0.9,
+    #     scale_pos_weight=1,
+    #     seed=1024,
+    #     max_depth=8,
+    #     eval_metric=mean_squared_error,
+    #     early_stopping_rounds=10,
+    #     missing=0,
+    # )
 
     # 5 折 OOF 训练段 + final XGB 测试段
     oof_train, pred_test_raw, xgb_final = compute_oof_y_xgb(
