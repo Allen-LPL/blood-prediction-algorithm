@@ -1089,11 +1089,14 @@ def evaluate_date_range(
     *,
     all_blood_df: Optional[pd.DataFrame] = None,
     weather_df: Optional[pd.DataFrame] = None,
-) -> dict:
-    """对采血做单步回测 (one-step-ahead).
-
-    返回 {"rows": [...], "summary": {...}}.
-    rows 每行包含真实值 + 预测值 + 误差.
+    anchor_decay_days: int = ANCHOR_DECAY_DAYS,
+    anchor_min_alpha: float = ANCHOR_MIN_ALPHA,
+    anchor_history_days: int = ANCHOR_HISTORY_DAYS,
+) -> list:
+    """混合预测 (eval + forecast):
+    - 真实历史覆盖范围内 [start_dt, min(end_dt, max_real_date)]: 单步预测,使用真实 lag/rolling
+    - 超出真实数据范围 (d > max_real_date): 走递推未来预测 (复用 predict_date_range)
+    返回 [{"date": "...", "predicted_volume": int}, ...] (简化字段, 不含真实值/诊断信息).
     """
     grp = _resolve_collection_group(station, blood_type)
     model, feat_cols = load_group_model(grp)
@@ -1108,7 +1111,7 @@ def evaluate_date_range(
         bool(lstm_pack["meta"].get("include_pku", True)) if lstm_pack else True
     )
     if all_blood_df is None:
-        # eval 需要包含 eval 区间的真实 target, 所以拉到 end_dt
+        # 拉历史 + eval 区间的真实数据 (end_dt 超出真实数据末尾时, DB 自然返回到末尾)
         hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
         engine = get_engine()
         all_blood_df = load_collection_daily(
@@ -1121,23 +1124,48 @@ def evaluate_date_range(
     if grp_df.empty:
         raise ValueError(f"无 {station}/{blood_type} 数据")
 
-    grp_df = _segment_aware_features(grp_df)
-    grp_df["label_tplus1"] = grp_df[TARGET_COL]
-    grp_df = grp_df.dropna(subset=["label_tplus1"])
+    # 真实数据时间末尾 (超过这个的就走递推预测)
+    max_real_date = pd.to_datetime(grp_df[DATE_COL]).max()
 
-    full_df = pd.merge(grp_df, weather_df, on="date", how="left")
-    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
-        full_df["dayofweek"] = full_df["weekday"]
-    for col in feat_cols:
-        if col not in full_df.columns:
-            full_df[col] = 0
+    rows: list = []
 
-    eval_dates = [
-        d for d in pd.date_range(start=start_dt, end=end_dt, freq="D")
-        if (full_df[DATE_COL] == d).any()
-    ]
-    rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
-    return {"rows": rows, "summary": _eval_summary(rows)}
+    # ---- Part 1: 真实数据覆盖范围 → 单步预测 (lag/rolling 基于真实历史) ----
+    eval_end = min(end_dt, max_real_date)
+    if start_dt <= eval_end:
+        eval_grp_df = _segment_aware_features(grp_df)
+        eval_grp_df["label_tplus1"] = eval_grp_df[TARGET_COL]
+        eval_grp_df = eval_grp_df.dropna(subset=["label_tplus1"])
+        full_df = pd.merge(eval_grp_df, weather_df, on="date", how="left")
+        if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+            full_df["dayofweek"] = full_df["weekday"]
+        for col in feat_cols:
+            if col not in full_df.columns:
+                full_df[col] = 0
+
+        eval_dates = [
+            d for d in pd.date_range(start=start_dt, end=eval_end, freq="D")
+            if (full_df[DATE_COL] == d).any()
+        ]
+        diag_rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
+        rows.extend(
+            {"date": r["date"], "predicted_volume": r["predicted_volume"]}
+            for r in diag_rows
+        )
+
+    # ---- Part 2: 超出真实数据末尾 → 递推未来预测 ----
+    if end_dt > max_real_date:
+        forecast_start = (max_real_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        forecast_preds = predict_date_range(
+            station, blood_type, forecast_start, end_date,
+            all_blood_df=all_blood_df,
+            weather_df=weather_df,
+            anchor_decay_days=anchor_decay_days,
+            anchor_min_alpha=anchor_min_alpha,
+            anchor_history_days=anchor_history_days,
+        )
+        rows.extend(forecast_preds)
+
+    return rows
 
 
 def evaluate_supply_range(
@@ -1146,8 +1174,15 @@ def evaluate_supply_range(
     *,
     supply_df: Optional[pd.DataFrame] = None,
     weather_df: Optional[pd.DataFrame] = None,
-) -> dict:
-    """对供血做单步回测."""
+    anchor_decay_days: int = ANCHOR_DECAY_DAYS,
+    anchor_min_alpha: float = ANCHOR_MIN_ALPHA,
+    anchor_history_days: int = ANCHOR_HISTORY_DAYS,
+) -> list:
+    """混合预测 (eval + forecast) 供血版本.
+
+    与 evaluate_date_range 同义: 真实历史覆盖范围走单步, 超出走递推.
+    返回 [{"date": "...", "predicted_volume": int}, ...].
+    """
     if scope == "global":
         grp = supply_global_group_name(category)
     else:
@@ -1174,28 +1209,53 @@ def evaluate_supply_range(
     if grp_df.empty:
         raise ValueError(f"无 {scope}/{category} 数据")
 
-    grp_df = _segment_aware_features(grp_df)
-    grp_df["label_tplus1"] = grp_df[TARGET_COL]
-    grp_df = grp_df.dropna(subset=["label_tplus1"])
-
     include_pku = (
         bool(lstm_pack["meta"].get("include_pku", False)) if lstm_pack else False
     )
     if weather_df is None:
         weather_df = _load_weather_features(include_pku=include_pku)
-    full_df = pd.merge(grp_df, weather_df, on="date", how="left")
-    if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
-        full_df["dayofweek"] = full_df["weekday"]
-    for col in feat_cols:
-        if col not in full_df.columns:
-            full_df[col] = 0
 
-    eval_dates = [
-        d for d in pd.date_range(start=start_dt, end=end_dt, freq="D")
-        if (full_df[DATE_COL] == d).any()
-    ]
-    rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
-    return {"rows": rows, "summary": _eval_summary(rows)}
+    max_real_date = pd.to_datetime(grp_df[DATE_COL]).max()
+
+    rows: list = []
+
+    # ---- Part 1: 真实数据覆盖范围 → 单步预测 ----
+    eval_end = min(end_dt, max_real_date)
+    if start_dt <= eval_end:
+        eval_grp_df = _segment_aware_features(grp_df)
+        eval_grp_df["label_tplus1"] = eval_grp_df[TARGET_COL]
+        eval_grp_df = eval_grp_df.dropna(subset=["label_tplus1"])
+        full_df = pd.merge(eval_grp_df, weather_df, on="date", how="left")
+        if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
+            full_df["dayofweek"] = full_df["weekday"]
+        for col in feat_cols:
+            if col not in full_df.columns:
+                full_df[col] = 0
+
+        eval_dates = [
+            d for d in pd.date_range(start=start_dt, end=eval_end, freq="D")
+            if (full_df[DATE_COL] == d).any()
+        ]
+        diag_rows = _one_step_evaluate(full_df, eval_dates, model, feat_cols, lstm_pack)
+        rows.extend(
+            {"date": r["date"], "predicted_volume": r["predicted_volume"]}
+            for r in diag_rows
+        )
+
+    # ---- Part 2: 超出真实数据末尾 → 递推未来预测 ----
+    if end_dt > max_real_date:
+        forecast_start = (max_real_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        forecast_preds = predict_supply_range(
+            scope, category, forecast_start, end_date, org=org,
+            supply_df=supply_df,
+            weather_df=weather_df,
+            anchor_decay_days=anchor_decay_days,
+            anchor_min_alpha=anchor_min_alpha,
+            anchor_history_days=anchor_history_days,
+        )
+        rows.extend(forecast_preds)
+
+    return rows
 
 
 def aggregate_predictions(daily_preds: list, date_type: str) -> list:
@@ -1533,7 +1593,7 @@ def create_app():
             "categories": results_by_category,
         }
 
-    # ---- 回测端点 (one-step-ahead with ground truth, 调试/汇报用) ----
+    # ---- 混合预测端点 (in-data 单步 + 超出范围递推) ----
 
     @app.get("/eval/collection")
     def api_eval_collection(
@@ -1541,15 +1601,32 @@ def create_app():
         end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         station: str = Query("北京市红十字血液中心"),
         blood_types: str = Query("ALL", description="逗号分隔血型, 如 ALL,A,B,O,AB"),
+        date_type: str = Query(
+            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
+        ),
+        anchor_decay_days: int = Query(
+            ANCHOR_DECAY_DAYS,
+            description="anchor 衰减天数 (仅用于超出真实数据的递推部分)",
+        ),
+        anchor_min_alpha: float = Query(
+            ANCHOR_MIN_ALPHA,
+            description="anchor 最低权重 (仅用于超出真实数据的递推部分);1.0 关闭",
+        ),
+        anchor_history_days: int = Query(
+            ANCHOR_HISTORY_DAYS,
+            description="anchor 历史窗口天数 (仅用于超出真实数据的递推部分)",
+        ),
     ):
-        """**回测**: 用真实历史特征做单步预测, 等价 v5 的测试段评估.
-
-        与 /predict/collection 区别:
-          /predict: 真未来递推, 昨天的 lag1 = 昨天的预测值, 误差累积
-          /eval:    单步回测, 昨天的 lag1 = 昨天的真实值, 无误差累积
-        eval 的拟合度通常比 predict 高很多. 用于参数调优 / 模型对比 / 汇报.
-        **不能据此推断未来预测能力**.
+        """混合预测端点:
+          - 真实历史覆盖范围内: 单步预测 (lag/rolling 基于真实值, 形态准确)
+          - 超出真实数据末尾: 自动切换到递推未来预测
+        响应仅含日期 + 预测值, 不含真实数据.
         """
+        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
+            raise HTTPException(
+                400, f"date_type 不合法: {date_type}, 可选 DAY/MONTH/QUARTER/YEAR"
+            )
+
         bt_list = [b.strip() for b in blood_types.split(",") if b.strip()]
         if not bt_list:
             raise HTTPException(400, "blood_types 不能为空")
@@ -1573,35 +1650,38 @@ def create_app():
                     results_by_type.append({
                         "blood_type": bt, "group": grp,
                         "error": f"模型不存在: {grp}, 请先训练",
-                        "rows": [], "summary": {},
+                        "predictions": [],
                     })
                     continue
 
             try:
-                eval_result = evaluate_date_range(
+                daily_preds = evaluate_date_range(
                     station, bt, start_date, end_date,
                     all_blood_df=shared_blood_df,
                     weather_df=shared_weather_df,
+                    anchor_decay_days=anchor_decay_days,
+                    anchor_min_alpha=anchor_min_alpha,
+                    anchor_history_days=anchor_history_days,
                 )
+                preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:
                 results_by_type.append({
                     "blood_type": bt, "group": grp,
-                    "error": str(e), "rows": [], "summary": {},
+                    "error": str(e), "predictions": [],
                 })
                 continue
 
             results_by_type.append({
                 "blood_type": bt,
                 "group": grp,
-                "rows": eval_result["rows"],
-                "summary": eval_result["summary"],
+                "count": len(preds),
+                "predictions": preds,
             })
 
         return {
-            "mode": "backtest_one_step_ahead",
-            "warning": "回测端点: 使用真实历史特征做单步预测, 不等同于 /predict 的真未来预测",
             "business": "collection",
             "station": station,
+            "date_type": date_type,
             "start_date": start_date,
             "end_date": end_date,
             "blood_types": results_by_type,
@@ -1616,8 +1696,27 @@ def create_app():
         org: str = Query(None),
         start_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         end_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        date_type: str = Query(
+            "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
+        ),
+        anchor_decay_days: int = Query(
+            ANCHOR_DECAY_DAYS,
+            description="anchor 衰减天数 (仅用于超出真实数据的递推部分)",
+        ),
+        anchor_min_alpha: float = Query(
+            ANCHOR_MIN_ALPHA,
+            description="anchor 最低权重 (仅用于超出真实数据的递推部分);1.0 关闭",
+        ),
+        anchor_history_days: int = Query(
+            ANCHOR_HISTORY_DAYS,
+            description="anchor 历史窗口天数 (仅用于超出真实数据的递推部分)",
+        ),
     ):
-        """**回测**: 供血单步评估. 与 /eval/collection 同义."""
+        """混合预测端点 (供血): in-data 单步 + 超出范围递推. 响应仅含预测值."""
+        if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
+            raise HTTPException(
+                400, f"date_type 不合法: {date_type}, 可选 DAY/MONTH/QUARTER/YEAR"
+            )
         if scope == "org" and not org:
             raise HTTPException(400, "scope='org' requires org parameter")
         cat_list = [c.strip() for c in categories.split(",") if c.strip()]
@@ -1645,36 +1744,39 @@ def create_app():
                 results_by_category.append({
                     "category": cat, "group": grp,
                     "error": f"模型不存在: {grp}, 请先训练",
-                    "rows": [], "summary": {},
+                    "predictions": [],
                 })
                 continue
 
             try:
-                eval_result = evaluate_supply_range(
+                daily_preds = evaluate_supply_range(
                     scope, cat, start_date, end_date, org=org,
                     supply_df=shared_supply_df,
                     weather_df=shared_weather_df,
+                    anchor_decay_days=anchor_decay_days,
+                    anchor_min_alpha=anchor_min_alpha,
+                    anchor_history_days=anchor_history_days,
                 )
+                preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:
                 results_by_category.append({
                     "category": cat, "group": grp,
-                    "error": str(e), "rows": [], "summary": {},
+                    "error": str(e), "predictions": [],
                 })
                 continue
 
             results_by_category.append({
                 "category": cat,
                 "group": grp,
-                "rows": eval_result["rows"],
-                "summary": eval_result["summary"],
+                "count": len(preds),
+                "predictions": preds,
             })
 
         return {
-            "mode": "backtest_one_step_ahead",
-            "warning": "回测端点: 使用真实历史特征做单步预测, 不等同于 /predict 的真未来预测",
             "business": "supply",
             "scope": scope,
             "org": org,
+            "date_type": date_type,
             "start_date": start_date,
             "end_date": end_date,
             "categories": results_by_category,
