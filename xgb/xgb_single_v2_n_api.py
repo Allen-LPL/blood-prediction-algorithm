@@ -598,13 +598,15 @@ def train_supply(
 
 # 方案 A: 长 horizon 递推漂移控制
 # 每天 alpha 从 1.0 (纯 recursive) 衰减到 ANCHOR_MIN_ALPHA (anchor 权重最大),
-# anchor 来自 start_dt 前 28 天历史按 day-of-week 的均值.
-ANCHOR_DECAY_DAYS = 60   # alpha 衰减到下限的天数
-ANCHOR_MIN_ALPHA = 0.2   # alpha 下限,即锚点最大权重 = 1 - 0.2 = 0.8
-ANCHOR_HISTORY_DAYS = 28 # 用 start_dt 前 N 天历史构建 DOW 锚
+# anchor 来自 start_dt 前 ANCHOR_HISTORY_DAYS 天历史按 day-of-week 的均值.
+#
+# 默认参数偏"温和":让模型保留更多波峰波谷,但对长 horizon 仍有抗漂移作用.
+# 可在 API 层覆盖 (anchor_decay_days / anchor_min_alpha 参数).
+ANCHOR_DECAY_DAYS = 120   # alpha 衰减到下限的天数 (越大 → 越长时间保持纯递推)
+ANCHOR_MIN_ALPHA = 0.4    # alpha 下限 (越大 → 模型权重越大, anchor 越弱)
+ANCHOR_HISTORY_DAYS = 56  # 用 start_dt 前 N 天历史构建 DOW 锚 (8 周, 减少局部偏差)
 
-# 预测时从 DB 拉取的历史窗口 (天数). rolling28 + anchor 28 + 安全余量.
-# 比拉 12 年全量历史快得多.
+# 预测时从 DB 拉取的历史窗口 (天数). rolling28 + anchor 56 + 安全余量.
 PREDICT_HISTORY_DAYS = 365
 
 
@@ -626,12 +628,21 @@ def _compute_dow_anchors(hist_df: pd.DataFrame, last_n: int = ANCHOR_HISTORY_DAY
     return {int(k): float(v) for k, v in dow_means.items()}, overall
 
 
-def _anchor_alpha(days_ahead: int) -> float:
-    """随预测距离衰减的递推权重: day 0 → 1.0, day DECAY_DAYS → MIN_ALPHA, 之后保持."""
+def _anchor_alpha(
+    days_ahead: int,
+    decay_days: int = ANCHOR_DECAY_DAYS,
+    min_alpha: float = ANCHOR_MIN_ALPHA,
+) -> float:
+    """随预测距离衰减的递推权重: day 0 → 1.0, day decay_days → min_alpha, 之后保持.
+
+    min_alpha=1.0 等价于关闭 anchor (纯递推).
+    """
     if days_ahead <= 0:
         return 1.0
-    decay = max(0.0, 1.0 - days_ahead / ANCHOR_DECAY_DAYS)
-    return max(ANCHOR_MIN_ALPHA, decay)
+    if min_alpha >= 1.0:
+        return 1.0
+    decay = max(0.0, 1.0 - days_ahead / max(1, decay_days))
+    return max(min_alpha, decay)
 
 
 def _resolve_collection_group(station: str, blood_type: str) -> str:
@@ -657,6 +668,9 @@ def predict_date_range(
     *,
     all_blood_df: Optional[pd.DataFrame] = None,
     weather_df: Optional[pd.DataFrame] = None,
+    anchor_decay_days: int = ANCHOR_DECAY_DAYS,
+    anchor_min_alpha: float = ANCHOR_MIN_ALPHA,
+    anchor_history_days: int = ANCHOR_HISTORY_DAYS,
 ) -> list:
     """
     对指定 station + blood_type 在 [start_date, end_date] 范围内做逐日递推预测.
@@ -716,6 +730,9 @@ def predict_date_range(
         feat_cols=feat_cols,
         lstm_pack=lstm_pack,
         start_dt=start_dt,
+        anchor_decay_days=anchor_decay_days,
+        anchor_min_alpha=anchor_min_alpha,
+        anchor_history_days=anchor_history_days,
     )
     return predictions
 
@@ -727,6 +744,10 @@ def _recursive_predict(
     feat_cols: list,
     lstm_pack: Optional[dict],
     start_dt: pd.Timestamp,
+    *,
+    anchor_decay_days: int = ANCHOR_DECAY_DAYS,
+    anchor_min_alpha: float = ANCHOR_MIN_ALPHA,
+    anchor_history_days: int = ANCHOR_HISTORY_DAYS,
 ) -> list:
     """逐日递推预测.若提供 lstm_pack,则在 XGB 输出基础上叠加 LSTM 残差校正.
 
@@ -738,13 +759,14 @@ def _recursive_predict(
     """
     full_df = full_df.sort_values(DATE_COL).reset_index(drop=True)
 
-    # 计算 DOW 锚点 (基于 start_dt 前 28 天真实历史)
+    # 计算 DOW 锚点 (基于 start_dt 前 N 天真实历史)
     hist_for_anchor = full_df[full_df[DATE_COL] < start_dt]
     dow_anchor, overall_anchor = _compute_dow_anchors(
-        hist_for_anchor, last_n=ANCHOR_HISTORY_DAYS
+        hist_for_anchor, last_n=anchor_history_days
     )
     log.info(
-        "锚点(DOW): %s, 整体均值=%.1f",
+        "锚点(DOW)|history=%dd|decay=%dd|min_alpha=%.2f: %s, 整体=%.1f",
+        anchor_history_days, anchor_decay_days, anchor_min_alpha,
         {k: round(v, 1) for k, v in dow_anchor.items()}, overall_anchor,
     )
 
@@ -831,7 +853,11 @@ def _recursive_predict(
         # 锚定混合: 回写到 TARGET_COL 的值用于下一天的 lag/rolling 计算,
         # 用 blend 而不是纯 y_hat,防止递推漂移
         days_ahead = (cur_date - start_dt).days
-        alpha = _anchor_alpha(days_ahead)
+        alpha = _anchor_alpha(
+            days_ahead,
+            decay_days=anchor_decay_days,
+            min_alpha=anchor_min_alpha,
+        )
         anchor_val = dow_anchor.get(int(cur_date.dayofweek), overall_anchor)
         blended_target = alpha * y_hat + (1.0 - alpha) * anchor_val
         full_df.loc[cur_mask, TARGET_COL] = blended_target
@@ -858,6 +884,9 @@ def predict_supply_range(
     *,
     supply_df: Optional[pd.DataFrame] = None,
     weather_df: Optional[pd.DataFrame] = None,
+    anchor_decay_days: int = ANCHOR_DECAY_DAYS,
+    anchor_min_alpha: float = ANCHOR_MIN_ALPHA,
+    anchor_history_days: int = ANCHOR_HISTORY_DAYS,
 ) -> list:
     """
     对指定供血类型在 [start_date, end_date] 范围内做逐日递推预测.
@@ -920,6 +949,9 @@ def predict_supply_range(
         feat_cols=feat_cols,
         lstm_pack=lstm_pack,
         start_dt=start_dt,
+        anchor_decay_days=anchor_decay_days,
+        anchor_min_alpha=anchor_min_alpha,
+        anchor_history_days=anchor_history_days,
     )
     return predictions
 
@@ -1039,6 +1071,18 @@ def create_app():
         date_type: str = Query(
             "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
         ),
+        anchor_decay_days: int = Query(
+            ANCHOR_DECAY_DAYS,
+            description="anchor 衰减天数, 越大越长保留波动 (默认 120)",
+        ),
+        anchor_min_alpha: float = Query(
+            ANCHOR_MIN_ALPHA,
+            description="anchor 最低权重 (默认 0.4); 设为 1.0 关闭 anchor",
+        ),
+        anchor_history_days: int = Query(
+            ANCHOR_HISTORY_DAYS,
+            description="anchor 历史窗口天数 (默认 56)",
+        ),
     ):
         if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
             raise HTTPException(
@@ -1082,6 +1126,9 @@ def create_app():
                     station, bt, start_date, end_date,
                     all_blood_df=shared_blood_df,
                     weather_df=shared_weather_df,
+                    anchor_decay_days=anchor_decay_days,
+                    anchor_min_alpha=anchor_min_alpha,
+                    anchor_history_days=anchor_history_days,
                 )
                 preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:
@@ -1152,6 +1199,18 @@ def create_app():
         date_type: str = Query(
             "DAY", description="聚合粒度: DAY=日, MONTH=月, QUARTER=季, YEAR=年"
         ),
+        anchor_decay_days: int = Query(
+            ANCHOR_DECAY_DAYS,
+            description="anchor 衰减天数, 越大越长保留波动 (默认 120)",
+        ),
+        anchor_min_alpha: float = Query(
+            ANCHOR_MIN_ALPHA,
+            description="anchor 最低权重 (默认 0.4); 设为 1.0 关闭 anchor",
+        ),
+        anchor_history_days: int = Query(
+            ANCHOR_HISTORY_DAYS,
+            description="anchor 历史窗口天数 (默认 56)",
+        ),
     ):
         if date_type not in ("DAY", "MONTH", "QUARTER", "YEAR"):
             raise HTTPException(
@@ -1197,6 +1256,9 @@ def create_app():
                     scope, cat, start_date, end_date, org=org,
                     supply_df=shared_supply_df,
                     weather_df=shared_weather_df,
+                    anchor_decay_days=anchor_decay_days,
+                    anchor_min_alpha=anchor_min_alpha,
+                    anchor_history_days=anchor_history_days,
                 )
                 preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:

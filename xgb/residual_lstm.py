@@ -389,8 +389,18 @@ def save_lstm_artifacts(
     log.info("LSTM 工件已保存: %s", group_dir)
 
 
+# 模块级 LSTM 工件缓存: {abs_group_dir_str: (combined_mtime, artifacts_dict)}
+# mtime 变化即缓存失效, 重训会自动失效.
+_LSTM_ARTIFACTS_CACHE: dict = {}
+
+
 def load_lstm_artifacts(group_dir: Path) -> Optional[dict]:
-    """加载 LSTM 工件;任一文件缺失或 schema 不匹配则返回 None."""
+    """加载 LSTM 工件; 任一文件缺失或 schema 不匹配则返回 None.
+
+    带模块级缓存: 同一进程内对同一 group 的重复调用复用已加载模型,
+    避免每次 API 请求都重新 `tf.keras.models.load_model` (~1s/次).
+    通过文件 mtime 检测重训, 自动失效缓存.
+    """
     group_dir = Path(group_dir)
     files = {
         "lstm": group_dir / "lstm.keras",
@@ -405,6 +415,14 @@ def load_lstm_artifacts(group_dir: Path) -> Optional[dict]:
     if not TF_AVAILABLE:
         log.info("tensorflow 不可用,走纯 XGB: %s", group_dir)
         return None
+
+    # mtime-based 缓存校验
+    cache_key = str(group_dir.resolve())
+    combined_mtime = max(p.stat().st_mtime for p in files.values())
+    cached = _LSTM_ARTIFACTS_CACHE.get(cache_key)
+    if cached is not None and cached[0] == combined_mtime:
+        return cached[1]
+
     with open(files["meta"], "r", encoding="utf-8") as f:
         meta = json.load(f)
     if meta.get("schema_version") != LSTM_META_SCHEMA_VERSION:
@@ -414,12 +432,15 @@ def load_lstm_artifacts(group_dir: Path) -> Optional[dict]:
             group_dir,
         )
         return None
+    log.info("加载 LSTM 工件 (首次): %s", group_dir)
     lstm_model = tf.keras.models.load_model(str(files["lstm"]))
     feature_scaler = joblib.load(files["feature_scaler"])
     resid_scaler = joblib.load(files["resid_scaler"])
-    return {
+    artifacts = {
         "lstm_model": lstm_model,
         "feature_scaler": feature_scaler,
         "resid_scaler": resid_scaler,
         "meta": meta,
     }
+    _LSTM_ARTIFACTS_CACHE[cache_key] = (combined_mtime, artifacts)
+    return artifacts
