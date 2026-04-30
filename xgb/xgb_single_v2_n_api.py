@@ -195,12 +195,22 @@ def list_saved_models() -> list:
     )
 
 
-# ---------- 天气特征加载 ----------
+# ---------- 天气特征加载 (含模块级缓存) ----------
+
+_WEATHER_CACHE: Optional[pd.DataFrame] = None
 
 
 def _load_weather_features(include_pku: bool = True) -> pd.DataFrame:
-    """Load weather data with optional PKU season flag."""
-    df = load_weather_data()
+    """Load weather data with optional PKU season flag.
+
+    模块级缓存避免每次 API 请求都重读 CSV + 重跑 chinese_calendar 逐行 apply
+    (后者是慢点之一). 因为天气/日历数据在进程生命周期内不变, 缓存安全.
+    """
+    global _WEATHER_CACHE
+    if _WEATHER_CACHE is None:
+        _WEATHER_CACHE = load_weather_data()
+        log.info("天气特征已缓存 (%d 行)", len(_WEATHER_CACHE))
+    df = _WEATHER_CACHE
     if not include_pku:
         df = df.drop(columns=["is_pku_semester_start_season"], errors="ignore")
     return df
@@ -586,6 +596,43 @@ def train_supply(
 
 # ---------- 预测: 逐日递推 + 按粒度聚合 ----------
 
+# 方案 A: 长 horizon 递推漂移控制
+# 每天 alpha 从 1.0 (纯 recursive) 衰减到 ANCHOR_MIN_ALPHA (anchor 权重最大),
+# anchor 来自 start_dt 前 28 天历史按 day-of-week 的均值.
+ANCHOR_DECAY_DAYS = 60   # alpha 衰减到下限的天数
+ANCHOR_MIN_ALPHA = 0.2   # alpha 下限,即锚点最大权重 = 1 - 0.2 = 0.8
+ANCHOR_HISTORY_DAYS = 28 # 用 start_dt 前 N 天历史构建 DOW 锚
+
+# 预测时从 DB 拉取的历史窗口 (天数). rolling28 + anchor 28 + 安全余量.
+# 比拉 12 年全量历史快得多.
+PREDICT_HISTORY_DAYS = 365
+
+
+def _compute_dow_anchors(hist_df: pd.DataFrame, last_n: int = ANCHOR_HISTORY_DAYS) -> tuple:
+    """从历史 hist_df 末尾 last_n 天按 day-of-week 计算锚点均值.
+
+    返回 (dow_anchor_dict, overall_anchor):
+      dow_anchor_dict: {0..6 → 该 DOW 的均值}
+      overall_anchor: 整段均值, DOW 缺失时的 fallback
+    """
+    if hist_df is None or hist_df.empty:
+        return {}, 0.0
+    sub = hist_df.sort_values(DATE_COL).tail(last_n)
+    if sub.empty:
+        return {}, 0.0
+    dows = pd.to_datetime(sub[DATE_COL]).dt.dayofweek
+    dow_means = sub.groupby(dows)[TARGET_COL].mean().to_dict()
+    overall = float(sub[TARGET_COL].mean())
+    return {int(k): float(v) for k, v in dow_means.items()}, overall
+
+
+def _anchor_alpha(days_ahead: int) -> float:
+    """随预测距离衰减的递推权重: day 0 → 1.0, day DECAY_DAYS → MIN_ALPHA, 之后保持."""
+    if days_ahead <= 0:
+        return 1.0
+    decay = max(0.0, 1.0 - days_ahead / ANCHOR_DECAY_DAYS)
+    return max(ANCHOR_MIN_ALPHA, decay)
+
 
 def _resolve_collection_group(station: str, blood_type: str) -> str:
     """解析采血模型 group 名: 优先新格式 collection__*,缺失时回退旧格式 station_blood."""
@@ -603,12 +650,21 @@ def _resolve_collection_group(station: str, blood_type: str) -> str:
 
 
 def predict_date_range(
-    station: str, blood_type: str, start_date: str, end_date: str
+    station: str,
+    blood_type: str,
+    start_date: str,
+    end_date: str,
+    *,
+    all_blood_df: Optional[pd.DataFrame] = None,
+    weather_df: Optional[pd.DataFrame] = None,
 ) -> list:
     """
     对指定 station + blood_type 在 [start_date, end_date] 范围内做逐日递推预测.
     数据从数据库加载;若该 group 训练过 LSTM 残差,会自动叠加 y_hat_adaptive.
     返回 [{"date": "2025-04-01", "predicted_volume": 42}, ...].
+
+    可选 all_blood_df / weather_df: 调用方预先加载好的数据 (如 API 一次请求多血型时
+    复用), 避免重复 DB 查询和天气加载.
     """
     grp = _resolve_collection_group(station, blood_type)
     model, feat_cols = load_group_model(grp)
@@ -619,12 +675,18 @@ def predict_date_range(
     if end_dt < start_dt:
         raise ValueError(f"end_date ({end_date}) 不能早于 start_date ({start_date})")
 
-    engine = get_engine()
     include_pku = (
         bool(lstm_pack["meta"].get("include_pku", True)) if lstm_pack else True
     )
-    all_blood_df = load_collection_daily(engine, station=station, end_date=start_date)
-    weather_df = _load_weather_features(include_pku=include_pku)
+    if all_blood_df is None:
+        # 只拉 start_dt 前 PREDICT_HISTORY_DAYS 天的历史, 大幅压缩 DB 拉取量
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        all_blood_df = load_collection_daily(
+            engine, station=station, start_date=hist_start, end_date=start_date
+        )
+    if weather_df is None:
+        weather_df = _load_weather_features(include_pku=include_pku)
     grp_df = _prepare_group_df(all_blood_df, station, blood_type)
 
     hist_df = grp_df[grp_df[DATE_COL] < start_dt].copy()
@@ -666,8 +728,25 @@ def _recursive_predict(
     lstm_pack: Optional[dict],
     start_dt: pd.Timestamp,
 ) -> list:
-    """逐日递推预测.若提供 lstm_pack,则在 XGB 输出基础上叠加 LSTM 残差校正."""
+    """逐日递推预测.若提供 lstm_pack,则在 XGB 输出基础上叠加 LSTM 残差校正.
+
+    方案 A 锚定混合: 长 horizon 时,回写到 TARGET_COL 的值不是纯 y_hat,而是
+        blend = α·y_hat + (1-α)·anchor[DOW]
+    其中 α 随 days_ahead 线性衰减 (1.0 → 0.2),anchor 来自 start_dt 前 28 天
+    按 DOW 的真实历史均值. 这样递推到第 60 天后,lag/rolling 特征会被锚点拉住,
+    避免单调下漂崩溃. 输出给用户的 predicted_volume 仍是模型原始 y_hat.
+    """
     full_df = full_df.sort_values(DATE_COL).reset_index(drop=True)
+
+    # 计算 DOW 锚点 (基于 start_dt 前 28 天真实历史)
+    hist_for_anchor = full_df[full_df[DATE_COL] < start_dt]
+    dow_anchor, overall_anchor = _compute_dow_anchors(
+        hist_for_anchor, last_n=ANCHOR_HISTORY_DAYS
+    )
+    log.info(
+        "锚点(DOW): %s, 整体均值=%.1f",
+        {k: round(v, 1) for k, v in dow_anchor.items()}, overall_anchor,
+    )
 
     use_lstm = lstm_pack is not None
     if use_lstm:
@@ -749,7 +828,14 @@ def _recursive_predict(
         y_hat = int(y_hat_arr[0])
         predictions.append({"date": str(cur_date.date()), "predicted_volume": y_hat})
 
-        full_df.loc[cur_mask, TARGET_COL] = y_hat
+        # 锚定混合: 回写到 TARGET_COL 的值用于下一天的 lag/rolling 计算,
+        # 用 blend 而不是纯 y_hat,防止递推漂移
+        days_ahead = (cur_date - start_dt).days
+        alpha = _anchor_alpha(days_ahead)
+        anchor_val = dow_anchor.get(int(cur_date.dayofweek), overall_anchor)
+        blended_target = alpha * y_hat + (1.0 - alpha) * anchor_val
+        full_df.loc[cur_mask, TARGET_COL] = blended_target
+
         if use_lstm:
             next_date = cur_date + pd.Timedelta(days=1)
             next_mask = full_df[DATE_COL] == next_date
@@ -764,11 +850,20 @@ def _recursive_predict(
 
 
 def predict_supply_range(
-    scope: str, category: str, start_date: str, end_date: str, org: Optional[str] = None
+    scope: str,
+    category: str,
+    start_date: str,
+    end_date: str,
+    org: Optional[str] = None,
+    *,
+    supply_df: Optional[pd.DataFrame] = None,
+    weather_df: Optional[pd.DataFrame] = None,
 ) -> list:
     """
     对指定供血类型在 [start_date, end_date] 范围内做逐日递推预测.
     数据从数据库加载;若该 group 训练过 LSTM 残差,会自动叠加 y_hat_adaptive.
+
+    可选 supply_df / weather_df: 调用方预加载,避免一次请求多类目重复查 DB.
     """
     if scope == "global":
         grp = supply_global_group_name(category)
@@ -785,8 +880,12 @@ def predict_supply_range(
     if end_dt < start_dt:
         raise ValueError(f"end_date ({end_date}) < start_date ({start_date})")
 
-    engine = get_engine()
-    supply_df = load_supply_daily(engine, scope=scope, org=org, end_date=start_date)
+    if supply_df is None:
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        supply_df = load_supply_daily(
+            engine, scope=scope, org=org, start_date=hist_start, end_date=start_date
+        )
     grp_df = _prepare_supply_group_df(supply_df, scope, category, org=org)
 
     hist_df = grp_df[grp_df[DATE_COL] < start_dt].copy()
@@ -804,7 +903,8 @@ def predict_supply_range(
     include_pku = (
         bool(lstm_pack["meta"].get("include_pku", False)) if lstm_pack else False
     )
-    weather_df = _load_weather_features(include_pku=include_pku)
+    if weather_df is None:
+        weather_df = _load_weather_features(include_pku=include_pku)
     full_df = pd.merge(full_df, weather_df, on="date", how="left")
     if "dayofweek" not in full_df.columns and "weekday" in full_df.columns:
         full_df["dayofweek"] = full_df["weekday"]
@@ -952,6 +1052,15 @@ def create_app():
         saved = list_saved_models()
         results_by_type = []
 
+        # 一次拉 DB + 加载天气, 各血型共享 (DB ~1-3s + 天气 ~1-2s 只付一次)
+        start_dt = pd.to_datetime(start_date)
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        shared_blood_df = load_collection_daily(
+            engine, station=station, start_date=hist_start, end_date=start_date
+        )
+        shared_weather_df = _load_weather_features(include_pku=True)
+
         for bt in bt_list:
             grp = collection_group_name(station, bt)
             if grp not in saved:
@@ -969,7 +1078,11 @@ def create_app():
                     continue
 
             try:
-                daily_preds = predict_date_range(station, bt, start_date, end_date)
+                daily_preds = predict_date_range(
+                    station, bt, start_date, end_date,
+                    all_blood_df=shared_blood_df,
+                    weather_df=shared_weather_df,
+                )
                 preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:
                 results_by_type.append(
@@ -1053,6 +1166,15 @@ def create_app():
         saved = list_saved_models()
         results_by_category = []
 
+        # 一次拉 DB + 加载天气, 各类别共享
+        start_dt = pd.to_datetime(start_date)
+        hist_start = (start_dt - pd.Timedelta(days=PREDICT_HISTORY_DAYS)).strftime("%Y-%m-%d")
+        engine = get_engine()
+        shared_supply_df = load_supply_daily(
+            engine, scope=scope, org=org, start_date=hist_start, end_date=start_date
+        )
+        shared_weather_df = _load_weather_features(include_pku=False)
+
         for cat in cat_list:
             if scope == "global":
                 grp = supply_global_group_name(cat)
@@ -1072,7 +1194,9 @@ def create_app():
 
             try:
                 daily_preds = predict_supply_range(
-                    scope, cat, start_date, end_date, org=org
+                    scope, cat, start_date, end_date, org=org,
+                    supply_df=shared_supply_df,
+                    weather_df=shared_weather_df,
                 )
                 preds = aggregate_predictions(daily_preds, date_type)
             except ValueError as e:
